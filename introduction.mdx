@@ -1,0 +1,27 @@
+---
+title: Introduction
+description: A production-ready Python SSR framework for Svelte 5.
+---
+
+Fymo is a Python web framework for building server-rendered Svelte 5 applications. It compiles Svelte components ahead of time with esbuild, renders them through a persistent Node.js sidecar over stdio, and serves a WSGI app from Python, no per-request compilation, no separate JS backend to maintain.
+
+## Why Fymo
+
+- **Build-time compilation** — Svelte components compile once via esbuild into hashed `dist/client/*.js` bundles, shared across routes.
+- **Persistent Node sidecar for SSR** — the Python process talks to a long-lived Node process over a stdio JSON protocol; the sidecar imports prebuilt SSR modules and renders per request in microseconds.
+- **Remote functions** — a SvelteKit-inspired RPC layer (`app/remote/*.py`) with a typed `$remote` client, devalue wire format, and CSRF protection.
+- **Batteries included** — session/password/OAuth auth, a durable Postgres job queue, and SSE-based broadcasts, all with codegen for the frontend.
+
+## Requirements
+
+- Python 3.11+
+- Node.js 20+ (Fymo's bundler shells out to esbuild)
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Fymo and scaffold your first project.
+  </Card>
+  <Card title="App directory contract" icon="folder-tree" href="/app-directory">
+    What goes where in an app/ tree, and what's enforced at build time.
+  </Card>
+</CardGroup>

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Fymo",
+  "description": "Production-ready Python SSR framework for Svelte 5.",
+  "colors": {
+    "primary": "#FF3E00",
+    "light": "#FF622E",
+    "dark": "#C7300A"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "introduction",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "app-directory"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/Bishwas-py/fymo"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Bishwas-py/fymo"
+    }
+  }
+}
