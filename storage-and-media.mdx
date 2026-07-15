@@ -1,0 +1,187 @@
+---
+title: Storage and Media
+description: The StorageProvider abstraction for where files live, and declarative media routes for serving them with byte-range support.
+---
+
+```yaml fymo.yml
+storage:
+  provider: local
+  root: data/uploads
+```
+
+Anywhere Fymo needs to put or get a blob of bytes, declarative media serving today, app-written uploads or generated files tomorrow, it goes through a `StorageProvider` instead of a hardcoded filesystem path. The `storage:` section in `fymo.yml` picks which one: the built-in `local` provider, or a dotted path to a class of your own.
+
+There's exactly one active provider per app. That's different from auth, where several providers can be installed at once, each contributing the hooks it cares about. Every method on `StorageProvider` is load-bearing.
+
+## The provider interface
+
+```python
+from typing import Optional, Protocol, Tuple
+
+class StorageProvider(Protocol):
+    def write(self, key: str, data: bytes) -> None: ...
+    def read(self, key: str, range: Optional[Tuple[int, int]] = None) -> bytes: ...
+    def size(self, key: str) -> int: ...
+    def url_for(self, key: str) -> Optional[str]: ...
+    def exists(self, key: str) -> bool: ...
+    def delete(self, key: str) -> None: ...
+```
+
+`key` is a namespaced relative path, like `videos/foo.webm`, not a filesystem path. What it resolves to is entirely up to the provider: local disk today, S3 or another object store later.
+
+`fymo.storage.base.BaseStorageProvider` gives you a class to subclass with the right shape. Its defaults raise `NotImplementedError` rather than quietly returning empty bytes or a size of zero, so a half-finished provider fails at the call site instead of failing silently somewhere downstream. The one exception is `url_for`, which defaults to returning `None`: most providers, local disk included, have nothing to hand back, since callers proxy the file through the app instead.
+
+`read()` takes an optional `(start, end)` byte range, inclusive on both ends. If the range falls outside the object's actual size, a provider should raise `RangeNotSatisfiable(size)` rather than returning garbage or an empty slice:
+
+```python
+from fymo.storage.base import RangeNotSatisfiable
+
+class RangeNotSatisfiable(Exception):
+    def __init__(self, size: int):
+        self.size = size
+```
+
+Carrying `size` on the exception lets a caller build the RFC 7233 `416` response's `Content-Range: bytes */<size>` header without a second round trip just to look up how big the file is.
+
+## Local storage
+
+```python
+from fymo.storage.providers.local import LocalStorageProvider
+
+provider = LocalStorageProvider(project_root=project_root, root="data/uploads")
+provider.write("videos/clip.webm", data)
+provider.read("videos/clip.webm", range=(0, 999))
+```
+
+`LocalStorageProvider` stores blobs directly on disk under `root` (resolved relative to `project_root`), or under `project_root` itself when `root` is left out. Every key passes through the same traversal-safe, symlink-safe containment check Fymo already used for declarative media routes before this provider existed: no `..` segment, no absolute path override, and no symlink planted inside the root that resolves somewhere outside it. A key that fails the check raises `ValueError`, not a 500 from some unrelated filesystem error further down.
+
+A range read clamps `end` to the file's actual size rather than treating "past EOF" as an error. Only a start at or past EOF, or an end before start, counts as unsatisfiable:
+
+```python
+provider.write("clip.webm", b"0123456789")
+provider.read("clip.webm", range=(5, 999))  # -> b"56789", clamped, not rejected
+provider.read("clip.webm", range=(20, 30))  # -> raises RangeNotSatisfiable(size=10)
+```
+
+## Registering a provider
+
+```yaml fymo.yml
+# bare string, local rooted at project_root
+storage: local
+```
+
+```yaml fymo.yml
+# object form: built-in with options
+storage:
+  provider: local
+  root: data/uploads
+```
+
+```yaml fymo.yml
+# object form: a custom provider by dotted class path
+storage:
+  class: myapp.storage.S3StorageProvider
+  bucket: my-bucket
+```
+
+The object form's selector key is `provider`, matching the shape of the `storage:` section itself, not `type` like the `jobs:` or `broadcasts:` sections use. Anything else in the object (`root`, `bucket`, whatever your provider's constructor takes) gets passed straight through as keyword arguments.
+
+<Warning>
+There is no default storage provider. Every other pluggable subsystem in Fymo (auth, jobs, broadcasts) falls back to a sensible built-in when unconfigured. Storage doesn't, on purpose: silently writing to local disk is exactly the footgun that works fine in development and quietly loses data behind a load balancer in production. Leaving `storage:` out of `fymo.yml` when `media:` is configured fails at startup, not at the first write.
+</Warning>
+
+### Writing a custom provider
+
+```python
+# myapp/storage.py
+from typing import Dict, Optional, Tuple
+from fymo.storage.base import BaseStorageProvider, RangeNotSatisfiable
+
+class EchoStorageProvider(BaseStorageProvider):
+    def __init__(self) -> None:
+        self._data: Dict[str, bytes] = {}
+
+    def write(self, key: str, data: bytes) -> None:
+        self._data[key] = data
+
+    def read(self, key: str, range: Optional[Tuple[int, int]] = None) -> bytes:
+        data = self._data[key]
+        if range is None:
+            return data
+        start, end = range
+        size = len(data)
+        if start < 0 or start >= size or end < start:
+            raise RangeNotSatisfiable(size)
+        return data[start:min(end, size - 1) + 1]
+
+    def size(self, key: str) -> int:
+        return len(self._data[key])
+
+    def url_for(self, key: str) -> Optional[str]:
+        return None
+
+    def exists(self, key: str) -> bool:
+        return key in self._data
+
+    def delete(self, key: str) -> None:
+        del self._data[key]
+```
+
+Point `storage.class` at the dotted path and Fymo instantiates it with whatever other keys the config object has. There's no registration step beyond that: the class just needs to satisfy the `StorageProvider` shape.
+
+## Using storage in app code
+
+```python
+from fymo.storage import get_storage_provider
+
+def save_upload(data: bytes) -> None:
+    get_storage_provider().write("videos/clip.webm", data)
+```
+
+A remote function, a job, a controller, none of them call `build_storage_provider` directly. They reach the same provider `FymoApp` built at startup through `get_storage_provider()`, a process-wide singleton accessor that mirrors `fymo.jobs.get_job_provider()` and `fymo.broadcast.get_broadcast_provider()`.
+
+`FymoApp` calls `init_storage_provider(project_root, storage_config)` at startup whenever `storage:` is configured. A separate process, like `fymo jobs-worker`, isn't part of that startup sequence and has to call `init_storage_provider` itself before any job it runs can touch storage. Calling `get_storage_provider()` before either has happened raises `RuntimeError` rather than silently constructing a local-disk fallback.
+
+<Note>
+`write()` takes a complete `bytes` payload; there's no streaming append. Something that produces bytes incrementally, a Playwright recording running live, for instance, can't call `write()` until it's finished. Record to a scratch path first (a temp file, or `app/data/tmp/`), then read the finished file and call `write()` once with the whole thing. That pattern keeps working once storage stops being local disk, since object stores like S3 don't offer a "keep appending to this key" operation either.
+</Note>
+
+## Declarative media routes
+
+```yaml fymo.yml
+media:
+  - prefix: /media/videos/
+    dir: data/videos
+    extensions: [webm]
+```
+
+Before this existed, an app that needed to stream a video with seek and scrub support had to hand-write a raw WSGI handler: Range-header parsing, path-traversal validation, content-type mapping, 404/400 handling, all repeated per app. A `media:` entry turns that into a single declaration. Each entry becomes an `HttpRoute` with a handler Fymo owns, sitting alongside your app's own discovered routes rather than replacing that seam, since some things (webhooks, non-file responses) still want a fully custom route.
+
+| Key | Meaning |
+|---|---|
+| `prefix` | The URL path prefix requests are matched under, e.g. `/media/videos/`. |
+| `dir` | The storage-key namespace files are served from, joined onto the requested filename. Not a filesystem path, a prefix within whatever the configured storage provider resolves. |
+| `extensions` | Allowed file extensions, lowercase, no leading dot. A request for anything else gets a `400`, the same response as a path-traversal attempt, so a probing request can't tell the two apart. |
+
+<Warning>
+`/dist/` and `/assets/` are reserved: `FymoApp`'s own dispatch matches them before the app-routes loop runs. A `media:` prefix landing under either would never be reached. Fymo prints a startup warning if your prefix overlaps one of these, but still registers the route, since it's a smell worth flagging loudly rather than a guaranteed misconfiguration worth refusing to boot over.
+</Warning>
+
+### Byte-range requests
+
+A `GET` with no `Range` header returns the whole file as `200`, with `Accept-Ranges: bytes` and `Content-Length` set so a client knows range requests are supported at all. A `Range` header gets you a `206 Partial Content` with the matching `Content-Range`:
+
+```
+GET /media/videos/clip.webm
+Range: bytes=0-99
+
+206 Partial Content
+Content-Range: bytes 0-99/1024
+Content-Length: 100
+```
+
+The suffix form (`bytes=-100`, the last 100 bytes) and the open-ended form (`bytes=500-`, from byte 500 to EOF) both work. Only single ranges are supported, matching what video and audio scrubbing actually need; a comma-separated multi-range request would require a `multipart/byteranges` body that nothing here produces.
+
+An unsatisfiable range, a start at or past EOF, an end before start, gets a `416 Range Not Satisfiable` with `Content-Range: bytes */<size>` rather than a malformed partial response or a crash out of a negative slice length. A malformed `Range` header (non-numeric values) is a `400`, not an unhandled `ValueError`.
+
+Every one of these routes resolves its files through the configured storage provider, the same containment checks `LocalStorageProvider` applies to `read()` and `exists()` apply here too. A traversal attempt or a symlink planted inside the media directory that points outside it gets a `400`, same as any other unsafe key.

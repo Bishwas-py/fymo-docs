@@ -1,0 +1,107 @@
+---
+title: Development Setup
+description: Clone the framework, install its Python and Node dependencies, and run a bundled example app against your local checkout.
+---
+
+This page is for contributors working on the fymo framework itself (the `fymo/` package, its CLI, its build pipeline). If you're building an application with fymo, see the [quickstart](/quickstart) instead.
+
+## Prerequisites
+
+- Python 3.11 or newer (`pyproject.toml` sets `requires-python = ">=3.11"`)
+- Node.js 20 or newer (the bundler shells out to esbuild, and the SSR sidecar runs on Node)
+- [uv](https://docs.astral.sh/uv/) is what the project's own CI uses, but a plain `pip` + `venv` workflow works too
+
+<Steps>
+  <Step title="Clone the repo">
+    ```bash
+    git clone https://github.com/Bishwas-py/fymo.git
+    cd fymo
+    ```
+  </Step>
+
+  <Step title="Install Python dependencies">
+    With `uv`:
+
+    ```bash
+    uv sync
+    ```
+
+    This installs the `fymo` package itself in editable mode, plus the `dev` dependency group declared in `pyproject.toml`: `pytest`, `pytest-asyncio`, and `pydantic`.
+
+    Without `uv`, a virtualenv and an editable install cover the same ground:
+
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -e ".[pydantic]"
+    pip install pytest pytest-asyncio
+    ```
+  </Step>
+
+  <Step title="Install root npm dependencies">
+    ```bash
+    npm install
+    ```
+
+    The root `package.json` declares `svelte` and `devalue` as runtime dependencies, and `esbuild`, `esbuild-svelte`, `jsdom`, `svelte-preprocess`, and `typescript` as dev dependencies. These are what the framework's own build and test code (`fymo/build/js`) shells out to.
+  </Step>
+
+  <Step title="Run the test suite">
+    ```bash
+    uv run pytest tests/
+    ```
+
+    Or, without `uv`, with your virtualenv active:
+
+    ```bash
+    pytest tests/
+    ```
+
+    Tests are collected from `tests/`, following the `test_*.py` naming convention set in `[tool.pytest.ini_options]`.
+  </Step>
+</Steps>
+
+## Running an example app
+
+The repo ships two example apps under `examples/`: `blog_app` (remote functions, auth) and `todo_app` (a plain CRUD-style UI). Each has its own `package.json` and `requirements.txt`, since each is meant to be a standalone fymo project you could copy out of the repo.
+
+<Steps>
+  <Step title="Install the example's npm dependencies">
+    ```bash
+    cd examples/blog_app   # or examples/todo_app
+    npm install
+    ```
+  </Step>
+
+  <Step title="Build and serve">
+    ```bash
+    fymo build
+    fymo serve
+    ```
+
+    Or, for incremental rebuilds and browser reload while you work:
+
+    ```bash
+    fymo dev
+    ```
+
+    Visit `http://127.0.0.1:8000`.
+  </Step>
+</Steps>
+
+<Note>
+  Both example apps' `requirements.txt` list `fymo>=0.1.0`, meant to be satisfied from PyPI for someone cloning just the example. Neither the example apps nor the project's CI workflows (`.github/workflows/ci.yml`) document a separate step that points an example app's own dependency resolution at your local checkout. In practice, if you run the example from the same environment `uv sync` created at the repo root, `python`/`fymo` resolve to the editable install of your working copy rather than a published release, because that's how an editable install works, not because the example is specially wired for it. If you set up the example in its own fresh virtualenv instead, you'll need your own editable install step (`pip install -e /path/to/fymo`) to see local changes reflected.
+</Note>
+
+## Commit messages
+
+CI checks that non-merge commit messages follow [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): description`, with `type` one of `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, or `revert`. This is enforced by the `lint` job in `.github/workflows/ci.yml` on every push to `main`.
+
+<CardGroup cols={2}>
+  <Card title="App directory contract" icon="folder-tree" href="/app-directory">
+    What goes where in an app/ tree, and what's enforced at build time.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    The application-builder path: install fymo and scaffold a new project.
+  </Card>
+</CardGroup>

@@ -1,0 +1,231 @@
+---
+title: Production Deployment
+description: Running a Fymo app in production, from the gunicorn process model to security headers, secrets, and health checks.
+---
+
+This page covers what changes when a Fymo app moves from `fymo dev` to production: the process model, the reverse proxy in front of it, secret provisioning, worker sizing, the health check, and logging.
+
+<Warning>
+  The `Dockerfile` at the fymo framework repo root is a template, not something you build directly. Copy it (and `.dockerignore`) into your Fymo *project* directory, the one with `server.py`, `fymo.yml`, `app/`, `requirements.txt`, and `package.json`, then run `docker build` from there. `docker build` uses the current directory as its build context, so building from the framework repo instead of your project won't produce a working image.
+</Warning>
+
+## Process model
+
+`fymo serve --prod --workers N` runs the app under gunicorn. Gunicorn owns the worker processes, and each worker is a full Python process that also spawns its own Node child (`node dist/sidecar.mjs`) to perform SSR. That sidecar isn't shared across workers, it's created fresh after each fork, so a running production instance looks like this:
+
+```
+gunicorn arbiter
+├── worker 1 (python) --spawns--> node dist/sidecar.mjs (SSR child)
+├── worker 2 (python) --spawns--> node dist/sidecar.mjs (SSR child)
+└── worker N (python) --spawns--> node dist/sidecar.mjs (SSR child)
+```
+
+This is why the runtime container image needs both Python and Node. A Python-only image boots and passes a basic smoke check, but every page render fails once traffic hits it, since there's no Node sidecar to render with.
+
+## Reverse proxy and TLS
+
+Gunicorn, via the `sync` worker class fymo configures, should sit behind a reverse proxy that terminates TLS. Don't terminate TLS in gunicorn itself.
+
+Caddy terminates TLS (including automatic certificate issuance and renewal) and reverse-proxies to the app, setting `X-Forwarded-Proto` and `X-Forwarded-For` automatically:
+
+```
+example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+nginx needs those headers set explicitly:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+## The trust_proxy flag
+
+Fymo's rate limiter identifies clients by IP. By default it reads `REMOTE_ADDR`, which behind a reverse proxy is the proxy's own IP, not the client's. Set `trust_proxy: true` in `fymo.yml` only once you have a reverse proxy in front that you trust to set, and overwrite rather than append to, `X-Forwarded-For`:
+
+```yaml
+limits:
+  rate_limit:
+    enabled: true
+    requests_per_minute: 60
+    trust_proxy: true
+```
+
+If `trust_proxy` is enabled without a trusted proxy in front, a client can spoof `X-Forwarded-For` and bypass per-IP rate limiting entirely. Leave it `false` (the default) if the app is ever exposed directly.
+
+The same flag also gates whether HSTS (below) trusts `X-Forwarded-Proto`, one trust boundary, not two to keep in sync.
+
+<Tip>
+  Rate limiting defaults to enabled in production and disabled in dev, so `fymo dev` doesn't throttle local iteration. Set `limits.rate_limit.enabled` explicitly in `fymo.yml` if you need to override that in either direction.
+</Tip>
+
+## Security headers
+
+In production (`dev=False`), fymo adds `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and `Permissions-Policy` on every response, plus two conditional headers described below. Both defaults are skipped entirely in dev (`dev=True` / `FYMO_DEV=1`): no CSP noise on localhost, and HSTS is never forced, since it would break plain http locally and browsers cache it well past the dev session.
+
+### Content Security Policy
+
+Fymo ships a `Content-Security-Policy-Report-Only` header with a `default-src 'self'` baseline, unless you override it:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data: https:; font-src 'self' data:; connect-src 'self';
+object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+```
+
+It ships report-only, not enforcing, for a specific reason. Fymo's SSR page only needs `script-src 'self'` on its own (the hydration entry point is a same-origin `<script type="module" src="/dist/...">`, and the JSON prop/doc islands use `type="application/json"`, which browsers never execute regardless of policy). But `fymo.yml`'s `head.script.analyticsID` / `hotjar` / `custom` options inject inline `<script>` blocks and third-party hosts (Google Tag Manager, Hotjar) when configured. An enforcing `script-src 'self'` would silently break those the moment an app turns one on, which is the exact failure this default is meant to avoid. Report-only ships the header from day one, so violations show up in the browser console, without breaking anything.
+
+To move to an enforcing policy:
+
+1. Set your own CSP explicitly via `security.headers.extra` in `fymo.yml`. This always wins over the default, whether you set `Content-Security-Policy` (enforcing) or `Content-Security-Policy-Report-Only`:
+
+   ```yaml
+   security:
+     headers:
+       enabled: true
+       extra:
+         - ["Content-Security-Policy", "default-src 'self'; script-src 'self' 'nonce-<per-request-nonce>'"]
+   ```
+
+2. If you use `analyticsID` / `hotjar` / `custom` inline scripts, either add their required hosts to `script-src` (for example `https://www.googletagmanager.com https://static.hotjar.com`), or switch to nonces: generate a per-request nonce, add `'nonce-<value>'` to `script-src`, and add `nonce="<value>"` to each inline `<script>` tag. Fymo doesn't generate nonces for you today; `security.headers.extra` is a static list evaluated once at startup, so a true per-request nonce needs a small wrapper around your own middleware until first-class nonce support lands.
+3. Test in report-only first (watch the browser console, or a configured `report-uri`) before switching to enforcing. A too-strict policy fails closed, blocking the resource, rather than failing open.
+
+### HSTS
+
+`Strict-Transport-Security` (`max-age=31536000; includeSubDomains`) is added when the resolved request scheme is https. Behind a TLS-terminating reverse proxy the app sees plain http on the wire, so this honors `X-Forwarded-Proto` only when `trust_proxy: true`, the same anti-spoof gate as the rate limiter's `X-Forwarded-For` handling. Without `trust_proxy`, only a direct https connection triggers HSTS. A client spoofing `X-Forwarded-Proto: https` over plain http cannot force it on.
+
+## FYMO_SECRET
+
+Fymo signs auth cookies and session state with an HMAC key. In production, the app refuses to boot unless `FYMO_SECRET` is set to a string of at least 16 characters. That's a deliberate loud failure over silently running with a forgeable cookie.
+
+Generate one with:
+
+```sh
+python -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+A few provisioning rules follow from that:
+
+- Never commit it. It must not appear in `Dockerfile`, `fymo.yml`, version control, or CI logs.
+- Inject it as an environment variable at deploy time: `docker run -e FYMO_SECRET="$FYMO_SECRET" ...`, or a platform secret manager (AWS Secrets Manager / SSM, GCP Secret Manager, HashiCorp Vault, a Kubernetes `Secret` mounted as an env var) resolved into the container's environment at startup.
+- Use the same secret across all workers and replicas of one deployment. It's what lets a session signed by one process validate on another. Rotating it invalidates all existing sessions and cookies.
+- Keep `FYMO_DEV` unset (or `0`) in production. Setting it enables dev-only behavior (verbose tracebacks in 500s, cookies without the `Secure` flag) that must never run in production.
+
+## Environment variables in fymo.yml
+
+`fymo.yml` can reference environment variables directly, so a deployment-specific value (an auth issuer URL, an API base URL) doesn't force a custom Python class just to read `os.environ`:
+
+```yaml
+auth:
+  providers:
+    - type: oidc
+      id: auth0
+      authorize_endpoint: ${AUTH0_AUTHORIZE_ENDPOINT}
+      token_endpoint: ${AUTH0_TOKEN_ENDPOINT}
+      userinfo_endpoint: ${AUTH0_USERINFO_ENDPOINT}
+      client_id_env: AUTH0_CLIENT_ID
+      client_secret_env: AUTH0_CLIENT_SECRET
+```
+
+- `${VAR}` resolves to the environment variable's value. If it's unset, config loading fails immediately with a `ConfigurationError` naming the variable, rather than silently loading a config with the literal string `${VAR}` in it.
+- `${VAR:-default}` falls back to `default` (including an empty default, `${VAR:-}`) when `VAR` is unset. The default can itself reference another placeholder, e.g. `${A:-${B}}`, resolved the same way and only evaluated when `A` is actually unset.
+- The resolved value is always spliced back in as a quoted YAML string, so it can never be interpreted as YAML structure (an extra key, a new list item) no matter what characters it contains, including a literal newline. An env var populated from a less-trusted source than the yml file itself still can't restructure the config, only supply a string value.
+- Interpolation runs on the raw YAML text before parsing, so it works anywhere in the file, including inside `#` comments: a `${VAR}` written in a comment is still substituted and validated, since the substitution pass has no notion of YAML comments.
+
+### Conditional auth providers
+
+A provider entry can carry `required: auto` to make its inclusion depend on whether it's actually configured, instead of the app crashing on a missing constructor argument or silently registering a half-broken provider:
+
+```yaml
+auth:
+  providers:
+    - type: clerk
+      required: auto
+```
+
+With `required: auto` set, the registry calls the provider class's `is_configured()` classmethod before constructing it. If that returns `False`, the provider is skipped entirely: no error, no instance, it contributes nothing to the app. This lets a provider stay dormant in local dev (no Clerk or Auth0 env vars set) and activate once real values land in the environment, with no separate conditional wiring in app code. Any value other than the literal string `"auto"` for `required` raises a `ProviderConfigError` naming the bad value, rather than being silently ignored or crashing the constructor with an unrelated `TypeError`.
+
+`ClerkProvider` implements this fully out of the box: `is_configured()` checks for `CLERK_ISSUER`, falling back to decoding the Frontend API domain out of `PUBLIC_CLERK_PUBLISHABLE_KEY`, and `from_config()` derives `jwks_url` as `{issuer}/.well-known/jwks.json` when it isn't given explicitly. Neither env var needs a custom wrapper class or an explicit `issuer` / `jwks_url` in `fymo.yml`, the config block above is the entire setup. `is_configured()` defaults to `True` on `BaseProvider`, so every existing provider is unaffected; only an entry that both sets `required: auto` and points at a provider overriding the hook gets the conditional behavior.
+
+## Worker sizing
+
+Each gunicorn worker costs one Python process plus one Node sidecar process. Sizing purely on CPU core count (the usual `2 * cores + 1` rule of thumb) will overcommit memory here. Budget for:
+
+```
+total memory ≈ workers × (python_worker_rss + node_sidecar_rss)
+```
+
+Measure `python_worker_rss` and `node_sidecar_rss` for your app under representative load (component tree size and SSR payload size both affect the Node side) before picking a worker count, and leave headroom rather than sizing to the limit. Start conservative, `--workers 2` to `4` on a single host, and scale workers with observed memory, not just CPU.
+
+`--workers` is set via the CLI, so it can be tuned per environment without rebuilding the image:
+
+```sh
+fymo serve --host 0.0.0.0 --port 8000 --prod --workers 4
+```
+
+## Health checks
+
+`GET /healthz` is a liveness probe that bypasses auth, rate limiting, and the body-size cap. It pings the current worker's Node sidecar:
+
+- `200 {"status": "ok"}`: the sidecar responded, the worker is healthy.
+- `503 {"status": "degraded"}`: the sidecar is unavailable (crashed, hung, or not yet started).
+
+Point your load balancer or orchestrator health check (Docker `HEALTHCHECK`, a Kubernetes liveness or readiness probe, an ALB target group check) at this path. Since each gunicorn worker owns an independent sidecar, `/healthz` reflects the health of whichever worker served that particular request. A load balancer polling repeatedly across workers catches a single degraded worker within a few checks.
+
+`/healthz` is intentionally excluded from access logging, so frequent polling doesn't drown out real request logs.
+
+## Logging
+
+In production (`FYMO_DEV` unset or `0`), fymo emits one JSON object per line per request to stdout/stderr, no text formatting, no multi-line tracebacks mixed into the stream:
+
+```json
+{"method": "GET", "path": "/todos", "status": 200, "duration_ms": 4.21}
+```
+
+Only method, path, status, and duration are logged, never cookie values, request bodies, or auth headers. Configure the destination and level through `fymo.yml`:
+
+```yaml
+logging:
+  destination: file      # terminal (default) | file
+  file: log/fymo.log     # required when destination: file
+  level: info             # debug | info | warning | error
+  format: json            # text | json (default: text in dev, json in prod)
+```
+
+The same section drives both the web process and `fymo jobs-worker`, which emits one line per background job (started, succeeded, or failed, with duration). Job arguments, cookies, request bodies, and auth headers are never logged: fymo's own log lines never include them, and the `procrastinate` library's argument-echoing lines are suppressed in the worker (its logger is capped to `WARNING` by default, and its permanent-failure line is filtered out; fymo's own "job failed" line carries name, status, duration, and the traceback instead). Set the `procrastinate` logger to `INFO` explicitly only if you accept that its lines will include job arguments.
+
+Fymo owns a single handler on Python's root logger, so your app's own `logging.getLogger(...)` output and library logs share the same destination and format. Attach additional handlers in `server.py` if you need a second sink, such as Sentry.
+
+<Note>
+  File output is append-only with no built-in rotation. Use logrotate or your container platform's log driver.
+</Note>
+
+Don't write logs to a file inside the container in the first place if you can avoid it. Let the process log to stdout/stderr and let the container runtime's log driver (Docker's `json-file` or `local` driver, Kubernetes' pod log stream) or a sidecar log shipper (Vector, Fluent Bit, Filebeat) pick lines up and forward them to your log backend (CloudWatch, Loki, Elasticsearch, Datadog). Since each line is already a single JSON object, most shippers can parse it without a custom grok or regex rule.
+
+## Media routes
+
+Apps that need to serve binary files with `Range` support (video and audio seeking and scrubbing, in particular) don't need to hand-write a raw WSGI route for it. Declare them in `fymo.yml` instead:
+
+```yaml
+media:
+  - prefix: /media/videos/
+    dir: data/videos
+    extensions: [webm]
+```
+
+`prefix` is matched against the request path the same way fymo's own `/dist/` and `/assets/` routes are, as a path prefix, not a template. `dir` is resolved relative to the project root. `extensions` is the allow-list for the filename after the prefix; anything else, and any filename containing `..` or starting with `/`, gets a 400.
+
+Fymo owns the rest: single-range `Range: bytes=start-end` requests get a 206 with `Content-Range`, full-file requests get a 200 with `Content-Length`, missing files get a 404, and `Content-Type` is resolved from the filename via the standard library's `mimetypes` module. `media` can list multiple entries with different prefixes, directories, and extensions, and the section is entirely optional; apps without one register no extra routes at all.
+
+For a route that isn't just "serve a file from a directory" (webhooks, non-file responses), the raw WSGI extension point at `app/routes.py` sits alongside this for that rarer case.

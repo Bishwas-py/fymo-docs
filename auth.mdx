@@ -1,0 +1,153 @@
+---
+title: Authentication
+description: Sessions, providers, and route protection built into Fymo's auth module.
+---
+
+```yaml fymo.yml
+auth:
+  enabled: true
+```
+
+That's the whole config for email/password auth. It turns on a SQLite-backed user store, a signed session cookie, and a `password` provider exposing `signup`, `login`, `logout`, and `me` under `$remote/auth`. Everything past this point is about swapping or adding to those defaults.
+
+## Two independent axes
+
+Fymo's auth design splits into two things that don't have to agree with each other: how a session is *stored* once a user is recognized, and how a user *establishes* one in the first place.
+
+Storage is a single mechanism: a signed `fymo_session` cookie, set by fymo itself. Flow is pluggable: password credentials, an OAuth redirect, a hosted provider like Clerk that verifies its own JWT on every request instead of ever touching the fymo cookie. A password login and a Google login both end up minting the same `fymo_session` cookie; Clerk skips that cookie entirely and proves identity from its own token each request. `current_user()` doesn't care which axis produced the session, it just walks a resolver chain until one of them recognizes the request.
+
+## The session cookie
+
+```
+fymo_session=<user_id>.<issued_at>.<epoch>.<signature>
+```
+
+The cookie is `HttpOnly`, `SameSite=Lax`, marked `Secure` whenever the request is HTTPS (directly or behind a trust-proxy-aware load balancer), and expires after 7 days by default. The signature is an HMAC-SHA256 over `user_id`, `issued_at`, and `epoch`, keyed by `FYMO_SECRET`. `verify_session_token` rejects anything tampered with, expired, or malformed, and collapses all of those cases to the same "no session" answer, so a bad cookie can't be distinguished from a missing one.
+
+`epoch` is what makes logout and password changes actually work. It's a per-user counter stored in the database; a token only authenticates if the epoch it was minted under still matches the user's current epoch. `logout()` and `set_password_hash()` both bump it, which invalidates every outstanding session for that user in one write, no server-side session table to sweep.
+
+## Reading the current user
+
+```python
+from fymo.auth import current_user, require_auth
+
+@require_auth
+def create_comment(slug: str, input: NewComment):
+    author = current_user().email.split("@")[0]
+    ...
+```
+
+`current_user()` returns the authenticated `User`, or `None` if nothing recognizes the request. It works inside remote functions and inside controllers' `getContext()` the same way, since both run inside the same request scope. `@require_auth` wraps a function so that a missing user short-circuits into a 401 before the function body ever runs, rather than letting every handler check `current_user() is None` by hand:
+
+```python
+def require_auth(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if current_user() is None:
+            raise AuthRequired()
+        return fn(*args, **kwargs)
+    return wrapper
+```
+
+`AuthRequired` is a `RemoteError`, and the remote router already knows how to turn a `RemoteError` into the `{type: "error", status: 401, error: "unauthenticated"}` envelope the frontend expects, so a gated remote function needs nothing else. Stack it under `@remote` when the app uses `remote.explicit_optin`, order doesn't matter for the auth check itself:
+
+```python
+@remote
+@require_auth
+def create_comment(slug: str, input: NewComment) -> Comment:
+    ...
+```
+
+<Note>
+`current_user()` only works inside a request scope, remote functions and controllers get one automatically. Calling it anywhere else raises a `RuntimeError` rather than silently returning `None`, so a misplaced call fails loudly instead of looking like "logged out."
+</Note>
+
+## The password provider
+
+`password` is the default and only provider when `auth.providers` is left unset. It contributes the credential remote functions: `signup`, `login`, `logout`, `me`, plus email verification and password reset (`request_email_verification`, `verify_email`, `request_password_reset`, `reset_password`). Passwords are hashed with `scrypt` (stdlib, no extra dependency) and login runs a real hash comparison against a decoy value even when the email doesn't exist, so response timing can't be used to enumerate registered accounts.
+
+From the frontend, these come through the generated `$remote/auth` client:
+
+```ts
+import { login, signup } from '$remote/auth';
+
+await login(email, password);
+await signup(email, password);
+```
+
+A signup issues a session cookie immediately and, separately, sends a verification link through the `EmailSender` seam (`fymo.auth.email.EmailSender`). The default `LoggingEmailSender` just logs the link, which is enough to develop against; point `auth.email_sender` at a class of your own to send real mail.
+
+## OAuth providers
+
+```yaml fymo.yml
+auth:
+  providers:
+    - google
+    # or, any generic Authorization-Code IdP:
+    - type: oidc
+      id: auth0
+      authorize_endpoint: ${AUTH0_AUTHORIZE_ENDPOINT}
+      token_endpoint: ${AUTH0_TOKEN_ENDPOINT}
+      userinfo_endpoint: ${AUTH0_USERINFO_ENDPOINT}
+      client_id_env: AUTH0_CLIENT_ID
+      client_secret_env: AUTH0_CLIENT_SECRET
+```
+
+`google` is a built-in `OAuthProvider` subclass with Google's endpoints hardcoded; `type: oidc` is the same Authorization-Code + PKCE machinery configured against any provider's endpoints, which covers Auth0, Okta, GitHub, or a self-hosted IdP without writing a line of Python. Both add two HTTP routes, `/auth/<id>/start` and `/auth/<id>/callback`, rather than remote functions, since a browser redirect can't be a `$remote` call.
+
+The PKCE verifier and CSRF state are signed with `FYMO_SECRET` and round-tripped through the `state` query parameter, so there's no server-side store to clean up and no session needed between the redirect and the callback. On a successful callback, the provider looks up the user by the external identity first, then by verified email, and only creates a new account if neither matches, before setting the same `fymo_session` cookie password login would.
+
+## Clerk and hosted sessions
+
+Clerk (and any hosted-session provider like it) doesn't fit the OAuth redirect shape, the IdP already owns the login UI and the session, and every request just carries its JWT. `ClerkProvider` verifies that token per request instead of minting a fymo session:
+
+```yaml fymo.yml
+auth:
+  providers:
+    - clerk
+```
+
+That's genuinely all it takes if `CLERK_ISSUER` or `PUBLIC_CLERK_PUBLISHABLE_KEY` is already in the environment, which a Clerk app almost always has for its frontend anyway. `from_config()` resolves the issuer from `CLERK_ISSUER` when set, or decodes it out of the publishable key (`pk_test_.../pk_live_...` base64-encode the Frontend API domain), and derives `jwks_url` as `{issuer}/.well-known/jwks.json` when it isn't given explicitly. Pass `issuer:`, `jwks_url:`, or `audience:` in the config to override any of that.
+
+Verification is RS256-over-JWKS, which needs the `pyjwt[crypto]` extra installed; it's an optional dependency so core fymo stays dependency-free for apps that don't use Clerk. The first request from a given Clerk subject provisions a local `User` row automatically, the same `resolve_or_create_user` path OAuth uses, so `current_user()` returns a real fymo user either way.
+
+## Conditional providers
+
+```yaml fymo.yml
+auth:
+  providers:
+    - password
+    - type: clerk
+      required: auto
+```
+
+`required: auto` skips a provider entirely when it isn't configured, instead of the app crashing on a missing constructor argument. Before constructing the provider, the registry calls its `is_configured()` classmethod; `ClerkProvider.is_configured()` just checks whether `CLERK_ISSUER` or the publishable key is set. That lets Clerk stay dormant in local dev with no Clerk env vars at all, and switch on the moment real values land in a deployed environment, with no conditional wiring in app code. Any value other than the literal `"auto"` raises a config error rather than being silently ignored.
+
+## Env vars in provider config
+
+`${VAR}` in `fymo.yml` resolves to the environment variable's value at config-load time; an unset required variable fails the build immediately with the variable's name, rather than loading a config with the literal string `${VAR}` still in it. `${VAR:-default}` falls back to `default` (including an empty default) when the variable is unset. This runs on the raw YAML text before parsing, so secrets for OAuth or OIDC providers can live in the environment while `fymo.yml` itself stays free of anything sensitive:
+
+```yaml fymo.yml
+auth:
+  providers:
+    - type: oidc
+      id: okta
+      authorize_endpoint: ${OKTA_AUTHORIZE_ENDPOINT:-https://dev.okta.com/oauth2/v1/authorize}
+      client_id_env: OKTA_CLIENT_ID
+      client_secret_env: OKTA_CLIENT_SECRET
+```
+
+Note the OAuth providers already read `client_id`/`client_secret` from environment variables named by `client_id_env`/`client_secret_env`, so those two never need `${}` interpolation themselves, only the plainer config values (endpoint URLs, issuers) do.
+
+## Custom stores and providers
+
+`auth.user_store` and any provider's `class:` key both accept a dotted path, the same escape hatch used elsewhere in `fymo.yml`:
+
+```yaml fymo.yml
+auth:
+  user_store: my_app.auth.PostgresUserStore
+  providers:
+    - class: my_app.auth.SamlProvider
+```
+
+A custom `UserStore` implements the `UserStore` Protocol (`fymo.auth.store`), swap SQLite for Postgres or anything else without touching a single remote function, since `signup`/`login`/`current_user()` all go through `get_user_store()`. A custom `AuthProvider` subclasses `BaseProvider` (`fymo.auth.providers.base`) and overrides only the axis it participates in: `remote_functions()` for a credential flow, `http_routes()` for a redirect-based one, `resolve_session()` for a token-based one. The framework never branches on provider type, it only ever calls those three hooks.

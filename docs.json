@@ -18,9 +18,31 @@
         ]
       },
       {
-        "group": "Concepts",
+        "group": "Core Concepts",
         "pages": [
-          "app-directory"
+          "app-directory",
+          "controllers-and-routing",
+          "remote-functions",
+          "auth",
+          "jobs-and-broadcasts",
+          "storage-and-media",
+          "configuration",
+          "logging"
+        ]
+      },
+      {
+        "group": "Deploy",
+        "pages": [
+          "deployment"
+        ]
+      },
+      {
+        "group": "Contributing",
+        "pages": [
+          "development-setup",
+          "testing",
+          "architecture-tour",
+          "contribution-workflow"
         ]
       }
     ]

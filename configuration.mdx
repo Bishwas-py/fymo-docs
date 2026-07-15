@@ -1,0 +1,333 @@
+---
+title: Configuration Reference
+description: Every key fymo.yml supports, its type, its default, and how ${VAR} interpolation resolves it.
+---
+
+`fymo.yml` sits at the project root and is loaded once, at startup, by `ConfigManager` (`fymo/core/config.py`). The file is entirely optional: every section below has a default, so a project with no `fymo.yml` at all still boots, just with `auth` off, `jobs` on the in-process threaded provider, and so on.
+
+Each section is read through its own getter (`get_auth_config()`, `get_jobs_config()`, ...), and an explicitly-null section (`auth:` with nothing under it) behaves the same as an absent one, both resolve to `{}`.
+
+## Env var interpolation
+
+`${VAR}` and `${VAR:-default}` placeholders are resolved on the raw YAML text, before `yaml.safe_load` ever sees it. That happens once, over the whole file, not per-section, so a placeholder works identically whether it sits at the top level or three levels deep inside `auth.providers`.
+
+```yaml
+name: ${APP_NAME}
+description: ${APP_DESC:-a fymo app}
+
+auth:
+  providers:
+    - type: oidc
+      issuer: ${OIDC_ISSUER}
+```
+
+- `${VAR}` is required. If `VAR` isn't set in the environment, config loading raises `ConfigurationError` naming the variable, rather than silently loading the literal string `${VAR}`.
+- `${VAR:-default}` falls back to `default` when `VAR` is unset. The default is only evaluated when it's actually needed, so `${A:-${B}}` never touches `B` if `A` is set.
+- An empty default (`${VAR:-}`) resolves to an empty string, not an error.
+- A default can contain literal braces, `${VAR:-{"a":1}}` resolves to `{"a":1}`, brace matching counts depth rather than stopping at the first `}`.
+- An unterminated `${` or a malformed variable name (`${123bad}`) both raise `ConfigurationError` at load time, naming the problem.
+
+<Note>
+Every resolved value is spliced back into the YAML text as an explicit double-quoted scalar, never as a raw substring. An env var whose value happens to contain a newline followed by something that looks like a new YAML key (`admin: true`) can never restructure the parsed config, it only ever comes back out as the literal string it was. This is what makes interpolation safe to point at values you don't fully control.
+</Note>
+
+## Typed values from strings
+
+Every interpolated value is a plain YAML string, `${VAR}` never becomes a real bool or int just because the variable happens to hold `"true"` or `"60"`. That matters most for booleans: a bare `bool("false")` in Python is `True`, since any non-empty string is truthy. A config value like `auth.enabled: ${AUTH_ENABLED}` resolving to the string `"false"` would otherwise silently turn auth on.
+
+Fymo avoids this with `parse_bool(value, field=...)`, used everywhere a `fymo.yml` key means a boolean: `auth.enabled`, `remote.explicit_optin`, `security.headers.enabled`, `limits.rate_limit.enabled`, and `limits.rate_limit.trust_proxy`.
+
+| Input | Result |
+|---|---|
+| Python `True` / `False` | passed through unchanged |
+| `"true"` / `"TRUE"` / `" True "` (case- and whitespace-insensitive) | `True` |
+| `"false"` / `"FALSE"` / `" False "` | `False` |
+| anything else (`"yes"`, `"1"`, `""`, a non-string, non-bool) | raises `ConfigurationError` naming the field and the value |
+
+Numeric keys (`limits.max_body_bytes`, `limits.rate_limit.requests_per_minute`) don't need this treatment, `int("60")` already does the right thing, so those are coerced with a plain `int(...)`.
+
+## Top-level keys
+
+| Key | Type | Default |
+|---|---|---|
+| `name` | string | `"Fymo App"` |
+| `version` | string | none (informational only) |
+| `description` | string | none (informational only) |
+
+`version` and `description` are read back with `ConfigManager.get(...)` if your own code wants them, but nothing in the framework itself enforces or consumes them.
+
+## routes
+
+```yaml
+routes:
+  root: index.index
+  resources:
+    - posts
+    - name: admin
+      soft_nav: false
+  about: pages.about
+```
+
+| Key | Meaning |
+|---|---|
+| `root` | `controller.action` for `/`. |
+| `resources` | A list of resource names, each expanded into index/show/new/edit/create/update/delete routes. An entry can be a bare string, or `{name, soft_nav}` to turn off SPA-style client navigation for that resource (`soft_nav` defaults to `true`). |
+| any other key | Treated as an explicit route: a string value is `controller.action`, an object value is passed through as-is. |
+
+## limits
+
+```yaml
+limits:
+  rate_limit:
+    enabled: true
+    requests_per_minute: 60
+    paths:
+      "/_fymo/remote/": 30
+    trust_proxy: false
+  max_body_bytes: 10485760
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `rate_limit.enabled` | bool | `true` in production, `false` in dev |
+| `rate_limit.requests_per_minute` | int | `60` |
+| `rate_limit.paths` | map of path prefix to int | `{}` (longest matching prefix wins over the default) |
+| `rate_limit.trust_proxy` | bool | `false` |
+| `max_body_bytes` | int | `10485760` (10 MB) |
+
+The rate limiter is a per-process, per-(client IP, matched rule) token bucket, there's no cross-worker sharing. `rate_limit.trust_proxy` controls whether the first hop of `X-Forwarded-For` is trusted as the client IP; only turn it on behind a reverse proxy that actually overwrites that header, otherwise a client can spoof its own rate-limit bucket. The same flag also gates whether `X-Forwarded-Proto` is honored when resolving the request's real scheme, for HSTS below and for the session cookie's `Secure` flag.
+
+## security
+
+```yaml
+security:
+  headers:
+    enabled: true
+    extra:
+      - ["Content-Security-Policy", "default-src 'self'"]
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `headers.enabled` | bool | `true` |
+| `headers.extra` | list of `[name, value]` pairs | `[]` |
+
+With `headers.enabled`, every response gets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and `Permissions-Policy`. In production (`dev=False`) two more defaults apply on top, and are skipped entirely in dev:
+
+- `Content-Security-Policy-Report-Only` with a `default-src 'self'` baseline, added only if `headers.extra` doesn't already set a CSP of either kind.
+- `Strict-Transport-Security`, added when the resolved request scheme is https (honoring `X-Forwarded-Proto` only if `limits.rate_limit.trust_proxy` is on).
+
+A header already present in the response from your own handler is never overwritten by these defaults.
+
+## auth
+
+```yaml
+auth:
+  enabled: true
+  user_store: fymo.auth.store.SqliteUserStore
+  email_sender: fymo.auth.email.LoggingEmailSender
+  providers:
+    - password
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `enabled` | bool | `false` |
+| `user_store` | dotted class path | `fymo.auth.store.SqliteUserStore` |
+| `email_sender` | dotted class path | `fymo.auth.email.LoggingEmailSender` |
+| `providers` | list of provider entries | `[password]` |
+
+A provider entry is either a bare built-in name (`password`, `google`, `oidc`, `clerk`) or an object with `type` (built-in) or `class` (dotted path to a custom provider), plus whatever extra keys that provider's constructor takes. Adding `required: auto` to an entry skips it entirely when the provider reports itself unconfigured, instead of crashing on a missing secret.
+
+<Card title="Authentication" icon="user-lock" href="/auth">
+Full provider config, the session cookie format, and how to write a custom UserStore or AuthProvider.
+</Card>
+
+## jobs
+
+```yaml
+jobs:
+  provider: threaded
+```
+
+```yaml
+jobs:
+  provider:
+    type: procrastinate
+    env_var: DATABASE_URL
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `provider` | bare string, or `{type/class, ...opts}` | `threaded` |
+
+`threaded` runs jobs in-process with no external dependency; a job is lost if the process restarts mid-run. `procrastinate` is a durable, Postgres-backed queue meant to be picked up by a separate `fymo jobs-worker` process, it needs the `procrastinate` extra installed and a database, read from `DATABASE_URL` by default.
+
+## broadcasts
+
+```yaml
+broadcasts:
+  provider: postgres
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `provider` | bare string, or `{type/class, ...opts}` | `postgres` |
+
+Same string-or-object shape as `jobs.provider`. `postgres` is currently the only built-in.
+
+## remote
+
+```yaml
+remote:
+  explicit_optin: true
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `explicit_optin` | bool | `false` |
+
+With `explicit_optin` off (the default), every public, type-annotated top-level function in `app/remote/*.py` is exposed to the browser. Turning it on requires `@remote` on each function you want reachable, everything else in that file stays server-only.
+
+## storage
+
+```yaml
+storage: local
+```
+
+```yaml
+storage:
+  provider: local
+  root: data/uploads
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `provider` (bare string form), or `provider`/`class` (object form) | string / dotted path | none, required if used |
+
+Unlike `jobs`, `broadcasts`, and `auth`, there is no fallback provider. Leaving `storage:` out of `fymo.yml` while `media:` is configured fails at startup, since silently writing to local disk is exactly the kind of default that works in dev and loses data in production.
+
+<Card title="Storage and Media" icon="folder-open" href="/storage-and-media">
+The StorageProvider interface, byte-range reads, and writing a custom provider.
+</Card>
+
+## media
+
+```yaml
+media:
+  - prefix: /media/videos/
+    dir: data/videos
+    extensions: [webm]
+```
+
+| Key | Meaning | Required |
+|---|---|---|
+| `prefix` | URL path prefix requests are matched under. | yes |
+| `dir` | Storage-key namespace files are resolved from, through the configured `storage:` provider. | yes |
+| `extensions` | Allowed extensions, lowercase, no leading dot. Anything else gets a `400`. | no, defaults to none allowed |
+
+`media:` is a list, defaults to `[]`. Each entry becomes a byte-range-aware `GET` route, useful for video/audio scrubbing, with no hand-written WSGI handler needed. A `prefix` under the reserved `/dist/` or `/assets/` paths only prints a startup warning, it doesn't fail the build, since those routes are matched first and would never be reached.
+
+## logging
+
+```yaml
+logging:
+  destination: file
+  file: log/fymo.log
+  level: info
+  format: json
+```
+
+| Key | Values | Default |
+|---|---|---|
+| `destination` | `terminal`, `file` | `terminal` |
+| `file` | path, required if `destination: file` | none |
+| `level` | `debug`, `info`, `warning`, `error` | `info` |
+| `format` | `text`, `json` | `text` in dev, `json` in prod |
+
+An unrecognized value in any of these raises `ValueError` naming the key at startup, fail-fast rather than silently logging somewhere unexpected.
+
+<Card title="Logging" icon="file-lines" href="/logging">
+What flows through fymo's single root-logger handler, and the shape of request and job log lines.
+</Card>
+
+## The identity secret
+
+Not a `fymo.yml` key, `FYMO_SECRET` is read directly from the environment, but it governs enough of the config surface above (signed session cookies, OAuth's PKCE state) to be worth calling out here.
+
+Resolution order at startup:
+
+1. `FYMO_SECRET` env var, used as raw UTF-8 bytes. Must be at least 16 characters, or startup raises.
+2. `.fymo/secret.key` on disk, if present and at least 16 bytes.
+3. Dev mode only (`dev=True` or `FYMO_DEV=1`): 32 random bytes are generated and written to `.fymo/secret.key` (mode `0600`) for reuse across restarts.
+4. Production with neither set: startup raises. A forgeable session cookie is a worse failure mode than refusing to boot.
+
+<Warning>
+`FYMO_DEV` and `FYMO_SECRET` are read with a simple truthy check (`"1"`, `"true"`, `"yes"`, `"on"`, case-insensitive), not `parse_bool`. That's deliberate: an unrecognized value defaulting a dev flag to `False` is a reasonable fallback for an env var read directly, it's the stricter `parse_bool` that governs actual `fymo.yml` booleans, where a typo should raise instead of guessing.
+</Warning>
+
+## Sections that aren't read
+
+Scaffolded example projects sometimes carry a `server:` block (`host`, `port`, `reload`) and a `build:` block (`output_dir`, `minify`) in their `fymo.yml`. Neither is consumed anywhere in the framework, host and port are CLI flags instead:
+
+```bash
+fymo dev --host 0.0.0.0 --port 8000
+fymo serve --host 0.0.0.0 --port 8000 --prod --workers 4
+```
+
+If you see those sections in an older or generated `fymo.yml`, they're inert, safe to leave, safe to delete.
+
+## Full example
+
+```yaml
+name: acme-blog
+version: 1.0.0
+description: "Blog with auth, background email, and video uploads"
+
+routes:
+  root: index.index
+  resources:
+    - posts
+    - tags
+
+auth:
+  enabled: true
+  providers:
+    - password
+    - type: oidc
+      id: okta
+      authorize_endpoint: ${OKTA_AUTHORIZE_ENDPOINT}
+      token_endpoint: ${OKTA_TOKEN_ENDPOINT}
+      userinfo_endpoint: ${OKTA_USERINFO_ENDPOINT}
+      client_id_env: OKTA_CLIENT_ID
+      client_secret_env: OKTA_CLIENT_SECRET
+      required: auto
+
+remote:
+  explicit_optin: true
+
+jobs:
+  provider: procrastinate
+
+broadcasts:
+  provider: postgres
+
+storage:
+  provider: local
+  root: data/uploads
+
+media:
+  - prefix: /media/videos/
+    dir: videos
+    extensions: [webm, mp4]
+
+limits:
+  rate_limit:
+    enabled: ${RATE_LIMIT_ENABLED:-true}
+    requests_per_minute: 120
+  max_body_bytes: 26214400
+
+logging:
+  destination: ${LOG_DESTINATION:-terminal}
+  level: ${LOG_LEVEL:-info}
+```

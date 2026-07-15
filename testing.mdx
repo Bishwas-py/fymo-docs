@@ -1,0 +1,121 @@
+---
+title: Testing
+description: How the framework's own test suite is organized, and how to run it.
+---
+
+Fymo's test suite lives under `tests/` and mirrors the shape of the `fymo/` package: each top-level module gets its own test directory, plus one extra directory for tests that cross module boundaries. As of this writing the suite has 108 `test_*.py` files.
+
+Two example apps under `examples/` (`todo_app` and `blog_app`) double as test fixtures. `blog_app` has real `app/remote/*.py` functions and auth enabled, so it's the one integration tests reach for when they need to exercise remote-function discovery, SSR, or a full request/response cycle.
+
+## Directory layout
+
+| Directory | Mirrors | Covers |
+|---|---|---|
+| `tests/auth` | `fymo/auth` | passwords, OAuth, sessions, Clerk provider, email verification |
+| `tests/broadcast` | `fymo/broadcast` | SSE channels, publish/subscribe, provider registry |
+| `tests/build` | `fymo/build` | esbuild pipeline, manifest generation, directory hygiene checks |
+| `tests/cli` | `fymo/cli` | `fymo init`, `fymo new`, the jobs worker command |
+| `tests/core` | `fymo/core` | HTML rendering, app discovery, config loading, the SSR controller, security defaults |
+| `tests/jobs` | `fymo/jobs` | task discovery, the job runner, provider registry |
+| `tests/remote` | `fymo/remote` | the `$remote` router, devalue wire format, codegen, opt-in rules |
+| `tests/server` | `fymo/server` | dev server, prod serving, the worker sidecar, Dockerfile smoke test |
+| `tests/storage` | `fymo/storage` | storage provider registry and the local provider |
+| `tests/integration` | (none, cross-cutting) | full request/response cycles against `todo_app` and `blog_app`, exercising build, routing, auth, and remote calls together |
+
+Provider-heavy modules (`broadcast`, `jobs`) additionally split provider-specific tests into a `providers/` subdirectory, so `tests/jobs/providers/test_procrastinate.py` sits next to `tests/jobs/test_job_runner.py` rather than everything living flat in one file.
+
+## Naming and config
+
+Pytest is configured in `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+norecursedirs = ["*.egg", ".*", "_darcs", "CVS", "dist", "node_modules", "venv", "{arch}"]
+```
+
+A file has to be named `test_*.py` and live under `tests/` to be collected. Most of the suite is plain functions (`test_*`), not classes, though `Test*` classes are picked up too if you use them. `tests/__init__.py` exists so integration tests can import helpers with a plain `from tests.integration._seed_helpers import seed_test_post`.
+
+## Running tests
+
+The project uses `uv`, so the full suite runs with:
+
+```bash
+uv run pytest tests/ -v
+```
+
+which is exactly what CI does (`.github/workflows/ci.yml`). To run everything in one module:
+
+```bash
+uv run pytest tests/core/
+```
+
+a single file:
+
+```bash
+uv run pytest tests/core/test_html.py
+```
+
+or a single test:
+
+```bash
+uv run pytest tests/core/test_html.py::test_minimal_html_structure
+```
+
+<Note>
+Fixtures that copy `examples/todo_app` or `examples/blog_app` skip with a clear message if that example's `node_modules` isn't installed yet. Run `npm install` inside the example directory first if you see those skips.
+</Note>
+
+## Unit vs integration
+
+Most of the suite is unit tests: one test file per source module, asserting on that module's behavior in isolation. `tests/core/test_html.py` is a representative example, it calls `build_html()` directly with hand-built `RouteAssets` and checks the returned markup, without spinning up a server or a build pipeline.
+
+```python
+def test_minimal_html_structure():
+    assets = RouteAssets(
+        ssr="ssr/todos.mjs",
+        client="client/todos.A1B2.js",
+        css="client/todos.A1B2.css",
+        preload=["client/chunk-datefns.X9Y8.js"],
+    )
+    html = build_html(
+        body="<div class='todo-app'>hi</div>",
+        head_extra="",
+        props={"todos": []},
+        assets=assets,
+        title="Todos",
+        asset_prefix="/dist",
+    )
+    assert "<!DOCTYPE html>" in html
+    assert '<link rel="stylesheet" href="/dist/client/todos.A1B2.css">' in html
+```
+
+`tests/integration/` is where several layers run together against a real example app: `fymo build` runs for real, a WSGI request goes through the actual app, and a remote call round-trips through the devalue wire format. `tests/integration/test_blog_e2e.py` builds `blog_app`, then drives it with a small `_wsgi_call()` helper that constructs a WSGI environ dict and collects the response, no test client library involved. In one test it renders the index page, renders a post detail page, calls the `get_posts` remote function, confirms an anonymous `create_comment` is rejected with a 401, signs up through the generated auth client, and then confirms the authenticated `create_comment` succeeds with the author taken from the session rather than client input.
+
+Because integration tests need a real SQLite row to render against, `tests/integration/_seed_helpers.py` exposes `seed_test_post()`, which inserts a post directly via `app.data.db`, bypassing markdown parsing entirely. It replaced an older markdown-file seeder; call it after the `blog_app` fixture has put the example on `sys.path`, and before building or hitting the app.
+
+## Fixtures
+
+`tests/conftest.py` defines the fixtures shared across the suite:
+
+<CardGroup cols={2}>
+  <Card title="example_app / blog_app" icon="copy">
+    Copy `examples/todo_app` or `examples/blog_app` into an isolated `tmp_path`, symlinking `node_modules` from the original so setup stays fast. `blog_app` also inserts the copy onto `sys.path` and cleans up both `sys.path` and the cached `app.*` modules afterward, since every copy shares the top-level package name `app`.
+  </Card>
+  <Card title="node_available" icon="hexagon-check">
+    Session-scoped, skips a test if `node` isn't on `PATH`. Used by anything that needs the SSR sidecar or a real `fymo build`.
+  </Card>
+  <Card title="_fymo_secret_for_tests" icon="key">
+    Autouse, session-scoped. Sets `FYMO_SECRET` so a `FymoApp` can be constructed without each test setting `dev=True` or managing a `.fymo/secret.key` file.
+  </Card>
+  <Card title="_reset_remote_router_globals" icon="rotate">
+    Autouse. `FymoApp.__init__` writes `_explicit_optin` and `_dev_mode` directly onto the `fymo.remote.router` module, so this fixture resets both to `False` after every test, preventing a test that builds over `blog_app` (which sets `remote.explicit_optin: true`) from leaking that setting into unrelated tests running later in the same process.
+  </Card>
+</CardGroup>
+
+<Warning>
+The `blog_app` fixture's `sys.path` and `sys.modules` cleanup exists for a specific reason: without it, a second test using a different `tmp_path` copy of `blog_app` would silently reuse the first test's cached `app.data.db` module, and `seed_test_post()` would write into the wrong SQLite file. If you add a fixture that imports from `app.*`, follow the same cleanup pattern.
+</Warning>

@@ -1,0 +1,79 @@
+---
+title: Logging
+description: Configure fymo's logging section in fymo.yml and see what gets logged automatically for requests and background jobs.
+---
+
+Fymo installs a single handler on Python's root logger at startup. That one handler is what makes fymo's own request/job logs, your app's `logging.getLogger(...)` calls, and library logs (Procrastinate in the jobs worker, for example) all land in the same place, in the same format, without any per-module setup.
+
+## Configuring fymo.yml
+
+Everything is controlled by the `logging:` section. The section is optional, every key has a default.
+
+```yaml
+logging:
+  destination: file       # terminal (default) or file
+  file: log/fymo.log      # required when destination is file
+  level: info              # debug | info | warning | error (default info)
+  format: json              # text | json (default: text in dev, json in prod)
+```
+
+| Key | Values | Default |
+|---|---|---|
+| `destination` | `terminal`, `file` | `terminal` |
+| `file` | path, required if `destination: file` | none |
+| `level` | `debug`, `info`, `warning`, `error` | `info` |
+| `format` | `text`, `json` | `text` in dev, `json` in prod |
+
+A relative `file` path resolves against the project root. Validation is fail-fast: an unrecognized value raises a `ValueError` naming the offending key at startup, rather than silently falling back to a default and logging somewhere you didn't expect.
+
+<Note>
+`configure()` is idempotent. Calling it again (as happens across a test session, or if you reload config) swaps out only the handler fymo itself installed. Handlers attached by anything else, pytest's `caplog` included, are left alone.
+</Note>
+
+## What gets captured
+
+Because the handler sits on the root logger, three sources flow through it:
+
+- Fymo's own access and job logs.
+- Any logger your app code creates with `logging.getLogger(__name__)`.
+- Library logs, such as Procrastinate's worker output in the jobs process.
+
+The root logger's level is set to match `logging.level`, since the stdlib default (`WARNING`) would otherwise filter out your app's `INFO` lines before the handler ever saw them.
+
+In text mode, app and library records print as `LEVEL logger: message`; fymo's own lines print pre-formatted (see below). In JSON mode, app and library records become `{"logger": ..., "level": ..., "message": ...}` objects, with an `exc_info` key added when the record carries a traceback.
+
+## Request logs
+
+One line is emitted per completed request, at `INFO`:
+
+```
+GET /dashboard 200 4.2ms
+```
+
+or, in JSON mode:
+
+```json
+{"method": "GET", "path": "/dashboard", "status": 200, "duration_ms": 4.2}
+```
+
+Only the method, path, status, and duration are ever logged. Cookies, request bodies, and auth headers are never touched by this code path, on purpose.
+
+## Job lifecycle logs
+
+Every job submitted through a `JobProvider` runs through a shared lifecycle wrapper, so both the threaded runner and the Procrastinate worker log the same three states:
+
+| Status | Level | When |
+|---|---|---|
+| `started` | `debug` | before the job function runs |
+| `succeeded` | `info` | after it returns, with `duration_ms` |
+| `failed` | `error` | on exception, with `duration_ms` and the traceback |
+
+```json
+{"job": "send_email", "status": "succeeded", "duration_ms": 812.4}
+```
+
+As with request logs, job arguments are never logged, since they can carry PII or secrets. This also means `started` lines are only visible when `level: debug` is set; at the default `info` level you'll see `succeeded` and `failed` only.
+
+<Warning>
+Procrastinate's own logger echoes each job's full call string (arguments included) at `INFO`. To avoid that leaking through the shared root handler, `run_worker()` caps the `procrastinate` logger to `WARNING` by default. If you explicitly call `logging.getLogger("procrastinate").setLevel(logging.INFO)` yourself before starting the worker, that choice is respected and left alone.
+</Warning>
