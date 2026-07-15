@@ -1,9 +1,9 @@
 ---
-title: The app/ directory contract
-description: What each app/ subdirectory is for, and what's enforced at build time.
+title: The app/ directory
+description: A map of where everything lives in a Fymo project.
 ---
 
-This is a short, factual reference for what each `app/` subdirectory is for. When in doubt, `fymo/build/hygiene.py` and `fymo/core/app_discovery.py` in the framework source are the source of truth; this page writes down what they already enforce (or, for `app/lib` and `app/support`, what they warn about).
+Every Fymo app is shaped the same way. Once you know this map, you know your way around any Fymo project, including the one you're about to build.
 
 | Directory | Language | Purpose |
 |---|---|---|
@@ -16,16 +16,16 @@ This is a short, factual reference for what each `app/` subdirectory is for. Whe
 | `app/lib` | TypeScript / Svelte | The `$lib/*` alias target (see `tsconfig.json`). TypeScript-only, there is no Python here, because nothing under `app/lib` ever runs server-side. |
 | `app/support` | Python | Shared server-side utilities that don't fit any of the above: a database connection helper, auth env config, media path helpers, and similar cross-cutting code imported by controllers/remote/jobs modules. |
 
-## Hard build errors
-
-`fymo build` and `fymo dev` both run `check_directory_hygiene()` (`fymo/build/hygiene.py`) before anything else: a `.svelte` file under `app/controllers/`, or a `.py` file under `app/templates/`/`app/components/`, fails the build. Nothing silently ignores the misplaced file, Python never imports a stray `.svelte`, and esbuild never bundles a stray `.py`, so without this check the file would just do nothing instead of erroring where a developer would notice.
-
-## `app/lib` warnings
-
-A `.py` file under `app/lib/` is almost always a sign the code belongs in `app/support/` instead. `app/lib` is the `$lib/*` alias target for TypeScript/Svelte imports, and Python there never gets bundled or run. Unlike the checks above, this is a build-time **warning**, not a hard failure: it doesn't block `fymo build` or `fymo dev`, it just prints a suggestion to move the file to `app/support/`.
-
 ## Task registries
 
-`app/jobs/*.py` files are meant to be thin task registries: a handful of submittable entry points, not a place implementation piles up. Because every non-underscore top-level function in `app/jobs/*.py` becomes a submittable task, helpers that shouldn't be submittable have to be underscore-prefixed to stay private, which is easy to forget, and easy for a file to grow past the point where "thin registry" is still true.
+`app/jobs/*.py` files are meant to be thin task registries: a handful of submittable entry points, not a place implementation piles up. Every non-underscore top-level function in `app/jobs/*.py` becomes a submittable task, so mark the ones you mean as entry points with `@task` (`from fymo.jobs import task`) to say so explicitly and keep the rest private with a leading underscore.
 
-`@task` (`from fymo.jobs import task`) marks a function as an intentional task entry point. It doesn't change what gets discovered: an undecorated top-level function is still registered exactly as before, for backward compatibility, but an undecorated one now also logs a one-line deprecation warning suggesting `@task` be added. Real implementation that a task calls into belongs in `app/support/`, not underscore-prefixed helpers living next to the task in the same module.
+`@task` doesn't change what gets discovered, an undecorated top-level function is still registered exactly as before, for backward compatibility. It's there so a module reads the same way regardless of habit, and so Fymo can gently nudge you toward it with a one-line log message rather than silently guessing.
+
+## A safety net, not a trap
+
+Fymo keeps an eye on a couple of easy mix-ups so you don't have to. If a `.svelte` file ends up under `app/controllers/`, or a `.py` file ends up under `app/templates/` or `app/components/`, `fymo build` and `fymo dev` catch it immediately and tell you exactly what's misplaced. Without that check, Python would simply never import the stray `.svelte` file, and esbuild would simply never bundle the stray `.py` file, so you'd just have a feature that quietly does nothing. Hearing about it the moment you save beats hunting for it later.
+
+<Tip>
+A `.py` file under `app/lib/` gets the gentle version of this: not a blocked build, just a friendly suggestion in the terminal that it probably belongs in `app/support/` instead. `app/lib` is the `$lib/*` alias for TypeScript and Svelte imports, so Python placed there never runs, Fymo is just looking out for you.
+</Tip>

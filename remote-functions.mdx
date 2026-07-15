@@ -99,7 +99,7 @@ export async function login(email: string, password: string) {
 }
 ```
 
-Fymo also lets a controller thread a remote function through as a prop rather than importing it client-side. `getContext()` can hand `create_comment` straight to a component; the server replaces it with a marker during SSR, and the client runtime swaps that marker for a real fetch wrapper on hydration. That's covered on the app directory contract page, this page focuses on calling `$remote/*` directly.
+Fymo also lets a controller thread a remote function through as a prop rather than importing it client-side. `getContext()` can hand `create_comment` straight to a component; the server replaces it with a marker during SSR, and the client runtime swaps that marker for a real fetch wrapper on hydration. That's covered on [the app/ directory](/app-directory) page, this page focuses on calling `$remote/*` directly.
 
 ## The wire format
 
