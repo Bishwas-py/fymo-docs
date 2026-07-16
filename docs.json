@@ -3,6 +3,7 @@
   "theme": "mint",
   "name": "Fymo",
   "description": "Production-ready Python SSR framework for Svelte 5.",
+  "favicon": "/images/favicon.png",
   "colors": {
     "primary": "#FF3E00",
     "light": "#FF622E",
