@@ -3,16 +3,18 @@ title: Architecture Tour
 description: A package-by-package tour of the fymo/ source tree, for anyone about to read or modify the framework itself.
 ---
 
-This page is a map, not a manual. It's for someone who just cloned fymo and is about to start grepping through `fymo/`, not for someone building an app on top of it. Each section below names the package's job in a sentence or two and points at the files that make it real. The source and the other concept pages cover the rest.
+This page is a map, not a manual. It's for someone who just cloned the repo and is about to start grepping through `fymo/`, not for someone building an app on top of it. Each section below names a package's job in a sentence or two and points at the files that make it real. The source and the other concept pages cover the rest.
 
-At the top level, `fymo/` splits into nine packages: `build`, `core`, `remote`, `auth`, `jobs`, `broadcast`, `storage`, `cli`, and `server`. There's also a small `utils` package for shared helpers like the CLI's color output, not architecturally interesting enough to get its own section.
+At the top level, `fymo/` splits into nine packages, listed in the table below. There's also a small `utils` package for shared helpers, like the CLI's color output, not interesting enough for its own section.
 
 ## The build/serve split
 
-Fymo has a hard line between build time and runtime. `build/` reads `app/` and produces `dist/`, a self-contained set of compiled assets: hashed client bundles, prebuilt SSR modules, a Node sidecar script, and a `manifest.json` describing all of it. `core/` never touches `app/templates/` or esbuild directly, it only reads `dist/`. If `dist/sidecar.mjs` is missing, `FymoApp.__init__` refuses to start rather than falling back to some slower on-demand path.
+Fymo draws a hard line between build time and runtime. The build package reads your app/ folder and produces dist/, a self-contained bundle of compiled assets. That includes hashed client bundles, prebuilt SSR modules, a Node sidecar script, and a manifest describing it all.
+
+core never touches app/templates/ or esbuild directly. It only reads from dist/. If the sidecar script is missing, FymoApp refuses to start rather than quietly falling back to some slower path.
 
 <Note>
-This is why `fymo build` is a required step before `fymo serve`, and why `fymo dev` runs a build loop of its own (`build/dev_orchestrator.py`) instead of recompiling per request.
+This is why `fymo build` is a required step before `fymo serve`. And it's why `fymo dev` runs its own build loop (in `build/dev_orchestrator.py`) instead of recompiling on every request.
 </Note>
 
 ## Package map
@@ -31,9 +33,9 @@ This is why `fymo build` is a required step before `fymo serve`, and why `fymo d
 
 ## Build pipeline
 
-`build/discovery.py` walks `app/templates/` and turns it into `Route` and `LayoutRef` objects: one route per `index.svelte` or `show.svelte`, plus any `_layout.svelte` files it finds along the way (root-level and per-resource). `build/pipeline.py`'s `BuildPipeline` takes that output, generates entry files, and invokes a Node build script as a subprocess, passing it a JSON config and reading back a JSON result over stdout. The result gets matched against the discovered routes and written into `dist/manifest.json` via `build/manifest.py`, the versioned contract that `core/` reads at runtime.
+`build/discovery.py` walks `app/templates/` and turns each file into a route or layout object. An `index.svelte` or `show.svelte` file becomes one route. Any `_layout.svelte` file becomes a layout, whether it sits at the root or inside a resource folder.
 
-`build/hygiene.py` runs before any of that. It enforces that `app/controllers/` stays Python-only and `app/templates/`/`app/components/` stay frontend-only (a misplaced file wouldn't error on its own, esbuild just silently ignores a stray `.py` and Python never imports a stray `.svelte`, so this check exists to catch it where a developer will actually see it). It also checks that a `media:` config always comes with a `storage:` config, and that any function `app/remote/*.py` would implicitly expose to the browser carries an explicit `@remote` marker.
+`build/pipeline.py`'s `BuildPipeline` class takes that output and drives the rest of the pipeline, generating entry files and handing them to a Node build script as a subprocess. It passes a JSON config in and reads a JSON result back over stdout. The result gets matched against the discovered routes and written into `dist/manifest.json`, the versioned contract that core reads at runtime.
 
 ```python
 # fymo/build/pipeline.py
@@ -41,37 +43,61 @@ class BuildPipeline:
     """Orchestrates: discover -> generate entries -> invoke esbuild -> write manifest."""
 ```
 
+`build/hygiene.py` runs before any of that, catching a few mistakes that would otherwise fail silently. It keeps `app/controllers/` Python-only, and the templates and components folders frontend-only. A misplaced file wouldn't raise an error on its own: esbuild just ignores a stray Python file, and Python never imports a stray Svelte file. This check exists so a developer actually sees the mistake, instead of chasing a silent no-op later.
+
+It also checks that a `media:` config always comes with a matching `storage:` config. And any function in `app/remote/*.py` meant for the browser must carry an explicit `@remote` marker.
+
 ## Core server and sidecar
 
-`core/server.py` defines `FymoApp`, the WSGI callable everything else plugs into. Its `__init__` is essentially a wiring diagram: it resolves the identity secret, sets up config and logging, builds the router, optionally initializes auth, always initializes the job and broadcast providers, and starts the Node sidecar. `__call__` times and access-logs every request, then `_dispatch` runs it through body-cap and rate-limit checks, security headers, and a chain of path prefixes (`/auth/`, `/_fymo/remote/`, `/_fymo/data/`, `/_fymo/broadcast/`, `/dist/`, `/assets/`) before falling through to a normal SSR page render.
+`core/server.py` defines `FymoApp`, the WSGI callable everything else plugs into. Its `__init__` method wires everything together. It resolves the identity secret, sets up config and logging, builds the router, and optionally sets up auth. It always initializes the job and broadcast providers, then starts the Node sidecar.
 
-`core/sidecar.py` is the other half of the runtime story: a persistent Node child process that speaks length-prefixed JSON frames over stdin/stdout. Python sends `{type: "render", route, props}` and gets back `{body, head}`. It restarts the child on a broken pipe and enforces a per-call timeout so a hung render can't wedge a WSGI worker forever. `core/ssr_controller.py` is the shared logic both the full-page render and the soft-nav data endpoint (`/_fymo/data/`) call into for invoking a controller's `getContext()`/`getDoc()`, so the two paths can't drift apart on how auth context gets opened.
+Each request gets timed and access-logged. Then it's dispatched through a chain of checks: body-cap and rate-limit limits, security headers, and routing by path prefix for auth, remote calls, data fetches, and broadcasts. Anything left over falls through to a normal SSR page render.
+
+`core/sidecar.py` is the other half of the runtime story, a persistent Node child process that speaks length-prefixed JSON frames over stdin and stdout. Python sends a render request with the route and its props, and gets back the rendered body and head. It restarts the child on a broken pipe, and enforces a per-call timeout so a hung render can't wedge a worker forever.
+
+`core/ssr_controller.py` holds the shared logic that both the full-page render and the soft-nav data endpoint call into. It's what invokes a controller's `getContext()` and `getDoc()`, so the two paths can't drift apart on how auth context gets opened.
 
 ## Remote functions
 
-`remote/discovery.py` finds every type-annotated public function in `app/remote/*.py` and hashes each module's file contents into a short module hash. That hash becomes part of the call URL, `POST /_fymo/remote/<hash>/<fn>`, so a stale client talking to a rebuilt server hits a 404 instead of calling the wrong code. `remote/router.py`'s `handle_remote` is the runtime half: it rejects non-POST and cross-origin requests (CSRF), resolves the hash back to a module through the manifest cache, decodes the devalue-encoded payload, validates arguments against the function's signature, runs the call inside a request scope, and always replies with `200 OK` wrapping either `{type: "result", ...}` or `{type: "error", ...}` in the body.
+`remote/discovery.py` finds every type-annotated public function in `app/remote/*.py`, and hashes each module's contents into a short module hash. That hash becomes part of the call URL (`POST /_fymo/remote/<hash>/<fn>`), so a stale client talking to a rebuilt server gets a 404 instead of calling the wrong code.
+
+`remote/router.py`'s `handle_remote` function is the runtime half of this story. It rejects non-POST and cross-origin requests, resolves the hash back to a module, and decodes the incoming payload. Then it validates arguments against the function's signature and runs the call in a request scope. It always replies with a 200, wrapping either a result or an error in the body.
 
 <Tip>
-The 200-always envelope is deliberate, it keeps the generated `$remote` client's error handling in one place (parse the JSON, branch on `type`) instead of also branching on HTTP status.
+The 200-always envelope is deliberate. It keeps the generated `$remote` client's error handling in one place, parsing the JSON and branching on `type`, instead of also branching on HTTP status.
 </Tip>
 
 ## Auth
 
-`auth/context.py` is where request-scoped identity lives: `current_user()` reads the `fymo_session` cookie, verifies it, and looks the user up through whichever `UserStore` was configured. `@require_auth` wraps a remote function and raises a `RemoteError` (serialized to a 401) when there's no user. Login and signup don't return a `Set-Cookie` header directly, they queue one through `queue_session_cookie()`, and `remote/router.py` drains that queue after the call returns. The session-resolver chain (`register_session_resolver`) is the seam other providers, like an OAuth or token-based one, plug into without needing a `fymo_session` cookie at all.
+`auth/context.py` is where request-scoped identity lives. `current_user()` reads and verifies the `fymo_session` cookie. Then it looks the user up through whichever `UserStore` is configured. `@require_auth` wraps a remote function and raises a `RemoteError`, serialized to a 401, when there's no user.
+
+Login and signup don't return a `Set-Cookie` header directly. Instead they queue one through `queue_session_cookie()`, and `remote/router.py` drains that queue after the call returns. The session-resolver chain, `register_session_resolver`, is the seam other providers, like an OAuth or token-based one, plug into without needing a `fymo_session` cookie at all.
 
 ## Jobs and broadcasts
 
-`jobs/discovery.py` and `broadcast/discovery.py` both discover a registry of functions from an `app/` subdirectory (`app/jobs/*.py`, `app/broadcasts/*.py`), and both are thin wrappers over the same shared walker in `core/app_discovery.py`. That walker used to be duplicated between the two, and the copies had quietly diverged on what happens with a duplicate name, one raised, the other let the last module win, so the collision policy is now an explicit argument the shared function forces every caller to pass. Jobs are submitted by name to a `JobProvider` (threaded by default); broadcasts are addressed by channel name from `publish()` and streamed to the browser over `/_fymo/broadcast/<module>/<channel>`, where the channel's own function body doubles as the subscribe-time authorization guard.
+`jobs/discovery.py` and `broadcast/discovery.py` both discover a registry of functions from an app subdirectory. Jobs live in `app/jobs/*.py`, and broadcasts live in `app/broadcasts/*.py`. Both discovery modules are thin wrappers over the same shared walker in `core/app_discovery.py`.
+
+That walker used to be duplicated between the two, and the copies had quietly diverged. One raised on a duplicate name, the other let the last module win. The collision policy is now an explicit argument the shared function forces every caller to pass.
+
+Jobs get submitted by name to a `JobProvider`, threaded by default. Broadcasts are addressed by channel name through `publish()`, and streamed to the browser at `/_fymo/broadcast/<module>/<channel>`. A channel's own function body doubles as its subscribe-time authorization guard.
 
 ## Storage
 
-`storage/registry.py` builds a single `StorageProvider` from `fymo.yml`'s `storage:` section. Unlike auth, jobs, or broadcasts, it has no default: an app with `media:` configured but no `storage:` section fails at build time and again at startup, rather than quietly writing files to local disk in dev and losing them the moment the app runs behind more than one instance in production.
+`storage/registry.py` builds a single `StorageProvider`. It reads that provider's config from the `storage:` section of `fymo.yml`. Unlike auth, jobs, or broadcasts, storage has no default.
+
+An app with `media:` configured but no `storage:` section fails at build time, and again at startup. That's safer than quietly writing files to local disk in dev, only to lose them once the app runs behind more than one instance in production.
 
 ## CLI and serving
 
-`cli/main.py` defines the `fymo` command group: `new` scaffolds a project, `init` adds Fymo to an existing one, `build` runs the build pipeline, `dev` runs a file-watching dev loop, `serve` starts the app (dev server by default, or gunicorn with `--prod`), and `jobs-worker` runs whichever `JobProvider`'s worker loop is configured.
+`cli/main.py` defines the `fymo` command group. `new` scaffolds a project, and `init` adds Fymo to an existing one. `build` runs the build pipeline, and `dev` runs a file-watching dev loop.
 
-`server/dev.py` and `server/gunicorn.py` are the two things `serve` can hand a `FymoApp` to. The dev server is a threaded `wsgiref` server, plain `wsgiref` is single-threaded, which would let one slow request (or an open SSE subscription) block every other request. Production goes through gunicorn instead, and the handoff there is less obvious than it looks: each gunicorn worker is a forked process, and the Node sidecar's pipe is a plain file descriptor that a naive fork would inherit and share across worker siblings, corrupting the frame protocol. `server/gunicorn.py` avoids that by stopping the master's sidecar before any worker forks, then building a fresh, worker-owned `FymoApp` (and Node child) in a `post_fork` hook, so every worker ends up talking to its own sidecar process.
+`serve` starts the app, a dev server by default or gunicorn with `--prod`. And `jobs-worker` runs whichever `JobProvider`'s worker loop is configured.
+
+`server/dev.py` and `server/gunicorn.py` are the two places serve hands off to. The dev server is threaded, unlike a plain `wsgiref` server, which is single-threaded and would let one slow request, or an open SSE subscription, block everyone else.
+
+Production goes through gunicorn instead, and the handoff is trickier than it looks. Each gunicorn worker is a forked process, and the Node sidecar's pipe is a plain file descriptor. A naive fork would let worker siblings inherit and share that pipe, corrupting the frame protocol.
+
+It avoids this by stopping the sidecar before any worker forks, then building a fresh, worker-owned `FymoApp` in a `post_fork` hook. Every worker ends up talking to its own sidecar process.
 
 ## Where to go next
 

@@ -3,11 +3,11 @@ title: Contribution Workflow
 description: Branch naming, commit style, and pull request scope conventions for contributing to Fymo.
 ---
 
-This page describes the conventions this repository follows for branches, commits, and pull requests. It's a reference, not a tutorial, read it before opening a PR.
+This page covers how we name branches, write commits, and scope pull requests in this repo. Read it before opening your first PR, it'll save you a review round trip.
 
 ## Branch naming
 
-Branches are named `<type>/issue-<N>-<slug>`, where `<type>` is the kind of change (`feat`, `fix`, `perf`, `chore`) and `<N>` is the GitHub issue number the branch resolves. The slug is a short, hyphenated description of the change.
+Branches follow the pattern `<type>/issue-<N>-<slug>`. The type describes the kind of change, feat, fix, perf, or chore. The number is the GitHub issue the branch resolves, and the slug is a short, hyphenated description.
 
 ```
 feat/issue-31-storage-accessor
@@ -15,7 +15,7 @@ fix/issue-30-typed-config-values
 perf/issue-13-remote-fn-reflection-cache
 ```
 
-If a change has no tracking issue (a small chore, a dependency bump), the branch drops the issue number and uses just `<type>/<slug>`, for example `chore/security-bump-svelte-devalue`.
+If a change has no tracking issue, a small chore or a dependency bump, drop the issue number. Use just `<type>/<slug>`, for example `chore/security-bump-svelte-devalue`.
 
 <Tip>
 Open the issue first if one doesn't exist. The issue number in the branch name is what ties a PR back to the problem it's solving.
@@ -23,9 +23,9 @@ Open the issue first if one doesn't exist. The issue number in the branch name i
 
 ## One issue, one PR
 
-Each pull request maps to a single GitHub issue. If two changes are logically independent, even when they touch the same area of the codebase, they get separate issues and separate PRs rather than being bundled together. A storage provider interface and a later accessor built on top of it are two issues and two PRs, not one.
+Each pull request maps to a single GitHub issue. Even if two changes touch the same area of the code, keep them separate when they're logically independent. Give each its own issue and its own PR rather than bundling them together.
 
-This keeps review scoped: a reviewer evaluates one change against one stated problem, and reverting a PR doesn't take unrelated work down with it.
+A storage provider interface and a later accessor built on top of it are two issues and two PRs, not one. This keeps review scoped. A reviewer can judge one change against one stated problem, and reverting a PR won't take unrelated work down with it.
 
 ## Commit messages
 
@@ -38,19 +38,25 @@ perf(remote): cache signature/type-hint reflection per (module, fn)
 refactor(build): shared prepare_build_config for fymo build and fymo dev
 ```
 
-Allowed types are `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, and `revert`. CI checks the subject line of every non-merge commit against this format and fails the build if it doesn't match.
+The allowed types are:
 
-The scope in parentheses names the module or subsystem the commit touches, `remote`, `storage`, `middleware`, `jobs`, not the issue number. The issue number already lives in the branch name.
+```
+feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+```
+
+CI checks the subject line of every non-merge commit against this format and fails the build if it doesn't match.
+
+The scope in parentheses names the module or subsystem a commit touches, things like remote, storage, middleware, or jobs. It's not the issue number, that already lives in the branch name.
 
 <Note>
-Merge commits are exempt from the format check, GitHub generates their subject line and it isn't meant to follow Conventional Commits.
+Merge commits are exempt from the format check. GitHub writes their subject line, and it isn't meant to follow Conventional Commits.
 </Note>
 
 ## PR scope
 
-A PR title states the outcome, not the mechanism. "Fail the build when @require_auth ships with zero active auth providers" and "Add a runtime accessor for the configured StorageProvider" both say what changed and why, without needing the diff open to find out.
+A PR title should state the outcome, not the mechanism. Take "Fail the build when @require_auth ships with zero active auth providers" or "Add a runtime accessor for the configured StorageProvider". Both say what changed and why, so you shouldn't need to open the diff to figure that out.
 
-Keep a PR to the size of its issue. A fix that touches three call sites for the same root cause, say the same interpolation bug in config, server, and remote discovery, is still one PR, because it's one issue and one cause. A fix that also refactors an unrelated helper along the way is two PRs.
+Keep a PR to the size of its issue. Say a fix touches three call sites for the same root cause, the same interpolation bug in config, server, and remote discovery. That's still one PR, since it's one issue and one cause. A fix that also refactors an unrelated helper along the way is two PRs.
 
 <Warning>
 If a PR grows past its original issue while you're working on it, split it. Open a new issue for the part that doesn't fit and file a separate PR against that issue.

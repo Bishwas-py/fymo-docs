@@ -10,22 +10,32 @@ Every Fymo app is shaped the same way. Once you know this map, you know your way
 | `app/controllers` | Python | Page controllers, one module per route, exposing `getContext()`/`getDoc()` to the matching template. |
 | `app/templates` | Svelte / TS | The page components the router renders, one file per route (plus `_layout.svelte` files and `_global.css`). |
 | `app/components` | Svelte / TS | Reusable UI components shared across templates. |
-| `app/remote` | Python | Functions callable from the browser via the generated `$remote` client. Public, type-annotated top-level functions are exposed by default; mark with `@remote` (`fymo.remote.remote`) to opt into `remote.explicit_optin` mode. |
-| `app/jobs` | Python | Background task registry, submitted through a `JobProvider`. Every non-underscore top-level function becomes a submittable task; mark task entry points with `@task` (`fymo.jobs.task`) to say so explicitly. |
+| `app/remote` | Python | Functions the browser can call directly through the generated `$remote` client. Public, type-annotated functions are exposed automatically. Add `@remote` to require opting in explicitly. |
+| `app/jobs` | Python | Background task registry, submitted through a `JobProvider`. Every top-level function becomes a submittable task automatically. Mark entry points with `@task` to make that explicit. |
 | `app/broadcasts` | Python | SSE channel definitions, discovered the same way as `app/jobs`. |
-| `app/lib` | TypeScript / Svelte | The `$lib/*` alias target (see `tsconfig.json`). TypeScript-only, there is no Python here, because nothing under `app/lib` ever runs server-side. |
-| `app/support` | Python | Shared server-side utilities that don't fit any of the above: a database connection helper, auth env config, media path helpers, and similar cross-cutting code imported by controllers/remote/jobs modules. |
+| `app/lib` | TypeScript / Svelte | The `$lib/*` alias target (see `tsconfig.json`). TypeScript-only, since nothing here ever runs on the server. |
+| `app/support` | Python | Shared server-side utilities that don't fit anywhere else: a database connection helper, auth env config, media path helpers, and similar cross-cutting code used by controllers, remote functions, and jobs. |
 
 ## Task registries
 
-`app/jobs/*.py` files are meant to be thin task registries: a handful of submittable entry points, not a place implementation piles up. Every non-underscore top-level function in `app/jobs/*.py` becomes a submittable task, so mark the ones you mean as entry points with `@task` (`from fymo.jobs import task`) to say so explicitly and keep the rest private with a leading underscore.
+Files under `app/jobs` are meant to stay thin. Think of it as a handful of submittable entry points, not a place where implementation piles up.
 
-`@task` doesn't change what gets discovered, an undecorated top-level function is still registered exactly as before, for backward compatibility. It's there so a module reads the same way regardless of habit, and so Fymo can gently nudge you toward it with a one-line log message rather than silently guessing.
-
-## A safety net, not a trap
-
-Fymo keeps an eye on a couple of easy mix-ups so you don't have to. If a `.svelte` file ends up under `app/controllers/`, or a `.py` file ends up under `app/templates/` or `app/components/`, `fymo build` and `fymo dev` catch it immediately and tell you exactly what's misplaced. Without that check, Python would simply never import the stray `.svelte` file, and esbuild would simply never bundle the stray `.py` file, so you'd just have a feature that quietly does nothing. Hearing about it the moment you save beats hunting for it later.
+Every top-level function without a leading underscore becomes a submittable task automatically. Mark the ones you mean as entry points with `@task` so that's explicit, and prefix any helper you don't want exposed with an underscore.
 
 <Tip>
-A `.py` file under `app/lib/` gets the gentle version of this: not a blocked build, just a friendly suggestion in the terminal that it probably belongs in `app/support/` instead. `app/lib` is the `$lib/*` alias for TypeScript and Svelte imports, so Python placed there never runs, Fymo is just looking out for you.
+Adding `@task` doesn't change what gets discovered. An undecorated top-level function is still registered exactly as before, for backward compatibility. The decorator just makes a module read the same way regardless of habit, and lets Fymo nudge you toward it with a log message instead of silently guessing.
+</Tip>
+
+## Safety net, not a trap
+
+Fymo watches for a couple of easy mix-ups so you don't have to.
+
+Say a Svelte file ends up in the controllers folder, or a Python file ends up in templates or components. The build catches it immediately. Both `fymo build` and `fymo dev` will tell you exactly what's misplaced, right when you save.
+
+<Note>
+Without this check, Python would simply never import a stray `.svelte` file, and esbuild would never bundle a stray `.py` file. You'd just have a feature that quietly does nothing. Hearing about it the moment you save beats hunting for it later.
+</Note>
+
+<Tip>
+A `.py` file under `app/lib` gets the gentle version of this: not a blocked build, just a friendly suggestion in the terminal that it probably belongs in `app/support` instead. `app/lib` is the `$lib/*` alias for TypeScript and Svelte imports, so Python placed there never runs. Fymo is just looking out for you.
 </Tip>

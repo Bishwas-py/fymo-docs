@@ -28,27 +28,27 @@ def get_post(slug: str) -> Post:
 </script>
 ```
 
-Any function you write in `app/remote/*.py` and call from `$remote/<module>` on the client, no route file, no fetch call, no hand-written JSON schema. This is Fymo's remote functions layer, modeled directly on SvelteKit's: a Python function is the endpoint, and the client you call it through is generated for you at build time.
+Write a function in `app/remote/*.py`, and you can call it from `$remote/<module>` on the client. No route file, no fetch call, no hand-written JSON schema required. This is Fymo's remote functions layer, modeled directly on SvelteKit's own approach. A Python function is the endpoint, and the client you call it through gets generated for you at build time.
 
 ## What gets exposed
 
-By default, every public, type-annotated top-level function in an `app/remote/*.py` module is callable from the browser. "Public" means the function name doesn't start with an underscore, and the same rule applies to the module: a file named `_helpers.py` is skipped entirely, and modules are only scanned for functions actually defined in them, not ones imported in from elsewhere.
+By default, every public function in an `app/remote/*.py` module is callable from the browser, as long as it's type-annotated. Public just means the name doesn't start with an underscore, and the same rule applies to the file itself: a module named `_helpers.py` is skipped entirely. Only functions actually defined in a module are scanned, never ones imported in from elsewhere.
 
-Every parameter needs a type annotation. If one is missing, the build fails immediately rather than shipping a function that would fail unpredictably on the wire:
+Every parameter needs a type annotation. If one is missing, the build fails right away, instead of shipping a function that would break unpredictably later:
 
 ```python app/remote/bad.py
 def fn(x):  # ValueError at discovery time: please annotate parameter 'x'
     return x
 ```
 
-That "exposed by default" behavior is convenient for small apps, but it means a helper function sitting next to real endpoints in the same file is silently callable unless you underscore-prefix it. If you'd rather opt in explicitly, set `remote.explicit_optin` in `fymo.yml`:
+This "exposed by default" behavior is handy for small apps. But it also means a helper function living next to real endpoints in the same file becomes silently callable, unless you underscore-prefix it. If you'd rather opt in explicitly, set `remote.explicit_optin` in `fymo.yml`:
 
 ```yaml fymo.yml
 remote:
   explicit_optin: true
 ```
 
-With that flag on, only functions decorated with `@remote` are discovered and dispatchable. Everything else in `app/remote/*.py` is treated as a private helper, whether or not it's underscored:
+With that flag on, only functions decorated with `@remote` get discovered and dispatched. Everything else in the module is treated as a private helper, whether or not it's underscored:
 
 ```python app/remote/posts.py
 from fymo.remote import remote
@@ -64,7 +64,7 @@ def helper_used_by_get_posts():  # NOT exposed once explicit_optin is on,
     ...                          # even without decoration
 ```
 
-`@remote` itself doesn't wrap or change the function, it just stamps `__fymo_remote__ = True` on it. With `explicit_optin` off (the default), the decorator is a no-op as far as exposure goes, but it's still worth applying consistently so a module reads the same way regardless of which mode a project runs in.
+The `@remote` decorator itself doesn't wrap or change the function, it just stamps `__fymo_remote__ = True` on it. With `explicit_optin` off (the default), the decorator does nothing for exposure, since everything is already exposed. It's still worth applying consistently, though, so a module reads the same way no matter which mode a project runs in.
 
 <Note>
 Discovery and the request router both call the same `is_exposed_remote_fn()` check, so what the generated client can reach and what the server will actually dispatch never drift apart.
@@ -72,7 +72,9 @@ Discovery and the request router both call the same `is_exposed_remote_fn()` che
 
 ## The generated client
 
-Running the Fymo build walks `app/remote/*.py` and, for every module, writes a matching `.js` file (the fetch wrapper) and a `.d.ts` file (the types) under `dist/client/_remote/`. `$remote/posts` resolves to that generated pair, so importing from it in a Svelte component gives you real autocomplete and real return types, not `any`:
+Running the Fymo build walks every module in `app/remote/*.py`. For each one, it writes a matching `.js` file, the fetch wrapper, and a `.d.ts` file with the types. Both land under `dist/client/_remote/`.
+
+The path `$remote/posts` resolves to that generated pair. Importing from it in a Svelte component gives you real autocomplete and real return types, not `any`:
 
 ```ts
 // dist/client/_remote/posts.d.ts (generated, do not edit)
@@ -85,7 +87,9 @@ export function get_posts(): Promise<PostSummary[]>;
 export function get_post(slug: string): Promise<Post>;
 ```
 
-Calling one of these functions does a `POST /_fymo/remote/<hash>/<fn>` under the hood, `<hash>` is a content hash of the source module so a stale cached client can't silently call the wrong version of a function after a deploy. Every call is a plain `fetch`, so it behaves like any other async call in your component: `await` it, wrap it in `try`/`catch`, race it, whatever you'd normally do.
+Calling one of these functions sends a POST request to `/_fymo/remote/<hash>/<fn>` under the hood. The hash is a content hash of the source module, so a stale cached client can never silently call the wrong version of a function after a deploy.
+
+Every call is just a plain `fetch`, so it behaves like any other async call in your component. You can `await` it, wrap it in a `try/catch`, or race it, just like you'd do with anything else.
 
 Because the import path resolves to compiled JS with no server-only code in it, it's also safe to import lazily and keep out of your SSR bundle entirely:
 
@@ -99,30 +103,42 @@ export async function login(email: string, password: string) {
 }
 ```
 
-Fymo also lets a controller thread a remote function through as a prop rather than importing it client-side. `getContext()` can hand `create_comment` straight to a component; the server replaces it with a marker during SSR, and the client runtime swaps that marker for a real fetch wrapper on hydration. That's covered on [the app/ directory](/app-directory) page, this page focuses on calling `$remote/*` directly.
+Fymo also lets a controller thread a remote function through as a prop, instead of importing it on the client. `getContext()` can hand `create_comment` straight to a component. The server replaces it with a marker during server-side rendering, and the client runtime swaps that marker for a real fetch wrapper once the page hydrates. That's covered on the [app/ directory](/app-directory) page; this page focuses on calling `$remote/*` directly.
 
 ## The wire format
 
-Request and response bodies aren't plain JSON, they're encoded with [devalue](https://github.com/Rich-Harris/devalue), the same tagged-JSON format SvelteKit uses for its own form actions and load functions. Fymo ships a Python port that's wire-compatible with the JS package.
+Request and response bodies aren't plain JSON. They're encoded with [devalue](https://github.com/Rich-Harris/devalue), the same tagged-JSON format SvelteKit uses for its own form actions and load functions. Fymo ships a Python port that's wire-compatible with the JS package.
 
-Plain JSON can't represent a `Date`, a `Set`, or a repeated reference without you writing custom (de)serialization for each case. devalue can, and Fymo's implementation currently round-trips:
+Plain JSON can't represent a `Date`, a `Set`, or a repeated reference, not without you writing custom serialization code for every case. devalue can. Here's what Fymo's implementation currently round-trips:
 
 <CardGroup cols={2}>
   <Card title="Date / datetime" icon="calendar">
-    Python `date`/`datetime` values encode as `["Date", isoformat]` and decode back to real `date`/`datetime` objects, not strings.
+    Python date and datetime values encode as `["Date", isoformat]`, then decode back into real date objects, never plain strings.
   </Card>
   <Card title="Set / frozenset" icon="brackets-curly">
-    Encoded as `["Set", ...]`, decoded back into a Python `set`.
+    Encoded as `["Set", ...]`, then decoded back into a real Python set or frozenset.
   </Card>
   <Card title="NaN / Infinity / -0" icon="infinity">
-    Sentinel-encoded (`-3`, `-4`, `-5`, `-6`) so they survive a JSON round trip instead of becoming `null` or throwing.
+    Encoded as small sentinel numbers, so these special values survive a JSON round trip instead of turning into `null` or throwing.
   </Card>
   <Card title="Shared references" icon="link">
-    A value that appears twice in the same payload is encoded once and referenced by slot index the second time, cycles included.
+    A value that appears twice in the same payload gets encoded once, then referenced by slot index the second time. Cycles are handled too.
   </Card>
 </CardGroup>
 
-`Decimal`, `UUID`, `bytes`, and `Enum` values also encode cleanly (as a number, a string, base64, and the enum's value, respectively), and Pydantic models are flattened field-by-field. On the way in, argument validation goes further than type coercion: if you type a parameter as a `TypedDict`, dataclass, `NamedTuple`, or Pydantic model, the incoming payload is validated against that shape, not just passed through.
+<Accordion title="Exact wire encoding details">
+The sentinels behind NaN, Infinity, and -0 are the numbers `-3`, `-4`, `-5`, and `-6`. That's how they survive a JSON round trip cleanly instead of collapsing into `null`.
+
+A few more Python types round-trip too:
+
+- `Decimal` encodes as a number
+- `UUID` encodes as a string
+- `bytes` encodes as base64
+- `Enum` encodes as its value
+- Pydantic models are flattened field-by-field
+</Accordion>
+
+On the way in, validation goes further than simple type coercion. If a parameter is typed as a `TypedDict`, a dataclass, a `NamedTuple`, or a Pydantic model, the incoming payload is checked against that exact shape instead of just being passed through.
 
 ## Error handling
 
@@ -137,9 +153,21 @@ raise Forbidden("not your comment")          # 403, error: "forbidden"
 raise Conflict("slug already taken")         # 409, error: "conflict"
 ```
 
-Any of these (or a custom `RemoteError(message, status=..., code=...)`) is caught by the router before it becomes a generic failure, and comes back as a JSON envelope carrying `status`, `error`, and `message`. An exception that isn't a `RemoteError` still gets caught, it just always reports `status: 500, error: "internal"`; in dev mode the response also includes the exception message and a traceback, both of which are stripped in production.
+Any of these, or a custom `RemoteError(message, status=..., code=...)`, gets caught by the router before it turns into a generic failure. It comes back as a JSON envelope with three fields:
 
-On the client, the generated wrapper throws a real `Error` for any of these, with `status`, `error`, and (for validation failures) `issues` attached, so a component can branch on it the way `Comments.svelte` in the example blog app does:
+- `status`: the HTTP status code
+- `error`: a short machine-readable code
+- `message`: a human-readable description
+
+An exception that isn't a `RemoteError` still gets caught. It just always reports status 500 with error "internal". In dev mode, the response also includes the exception message and a traceback; both get stripped out in production.
+
+On the client, the generated wrapper throws a real `Error` for any of these. It attaches a few extra properties you can check:
+
+- `status`: the HTTP status code
+- `error`: the short error code
+- `issues`: present only for validation failures, an array pointing at the field that failed
+
+A component can branch on these the way `Comments.svelte` does in the example blog app:
 
 ```ts
 try {
@@ -150,14 +178,15 @@ try {
 }
 ```
 
-A failed pydantic validation (bad argument shape, not a raised `RemoteError`) comes back as `status: 422, error: "validation"` with an `issues` array you can use to point at the specific field that failed.
+A failed Pydantic validation, meaning a bad argument shape rather than a raised `RemoteError`, comes back differently. It reports status 422 with error `"validation"`, plus an `issues` array pointing at the specific field that failed.
 
 ## CSRF protection
 
-The remote endpoint at `/_fymo/remote/<hash>/<fn>` only accepts `POST`. That alone rules out the classic cookie-riding GET (an `<img src="...">` or a top-level navigation carries cookies but no `Origin` header, so restricting to POST closes that path outright).
+The remote endpoint at `/_fymo/remote/<hash>/<fn>` only accepts POST requests. That alone rules out the classic cookie-riding GET attack, where a plain `<img src="...">` tag or a top-level navigation carries your cookies along for the ride. Those requests never carry an `Origin` header, so restricting to POST closes that path outright.
 
-For POST requests, the router additionally checks that the `Origin` header, when present, matches the request's `Host`:
+For POST requests, the router additionally checks that the `Origin` header, when present, matches the request's `Host`. A cross-origin fetch or form POST always sends an `Origin` header, so a mismatched one gets rejected with `403 cross_origin` before your function ever runs. Same-origin requests pass through, including ones with no `Origin` header at all, which browsers omit for some same-origin cases.
 
+<Accordion title="The exact origin check">
 ```python
 def _origin_ok(environ: dict) -> bool:
     origin = environ.get("HTTP_ORIGIN")
@@ -167,14 +196,13 @@ def _origin_ok(environ: dict) -> bool:
     ...
     return origin == expected
 ```
-
-A cross-origin `fetch` or form POST always sends an `Origin` header, so a mismatched one is rejected with `403 cross_origin` before your function ever runs. Same-origin requests (including ones with no `Origin` header at all, which browsers omit for some same-origin cases) pass through.
+</Accordion>
 
 <Warning>
 This check runs whether or not you've enabled Fymo's auth module. It's the baseline protection for every remote function, not something you opt into per endpoint.
 </Warning>
 
-Alongside CSRF, every call carries a `fymo_uid` cookie: an HMAC-signed anonymous identity token, issued on first request and verified on every subsequent one. It's not an authentication credential by itself (a tampered or unsigned cookie is treated as absent and a fresh one is issued), but it gives you a stable, unforgeable handle for things like deduping a reaction or attributing an anonymous comment. Call `current_uid()` from inside a remote function to read it:
+Alongside CSRF protection, every call carries a `fymo_uid` cookie, an anonymous identity token issued on your first request. It's not an authentication credential by itself, but it gives you a stable, unforgeable handle, useful for things like deduping a reaction or attributing an anonymous comment. Call `current_uid()` from inside a remote function to read it:
 
 ```python
 from fymo.remote import current_uid
@@ -183,6 +211,10 @@ def toggle_reaction(slug: str, kind: ReactionKind) -> ReactionCounts:
     uid = current_uid()
     ...
 ```
+
+<Accordion title="How fymo_uid is signed and verified">
+The cookie is HMAC-signed and verified on every request. A tampered or unsigned cookie is treated as absent, and a fresh one gets issued in its place, so there's no way to forge a uid you don't already hold.
+</Accordion>
 
 For real authentication on top of that, see Fymo's auth module, layered independently on the same request.
 

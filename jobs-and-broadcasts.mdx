@@ -3,7 +3,9 @@ title: Jobs and Broadcasts
 description: Background task processing with pluggable job providers, and real-time updates pushed to the browser over server-sent events.
 ---
 
-Fymo is a synchronous, per-request WSGI framework, there's no built-in async runtime hiding underneath it. Jobs and broadcasts are the two escape hatches for the two things that don't fit a request/response cycle: doing work that outlives the request, and pushing state to the browser that the browser didn't ask for.
+Fymo is a synchronous, per-request framework built on WSGI. There's no async runtime hiding underneath it.
+
+Jobs and broadcasts are the two escape hatches for what doesn't fit a request and response cycle. Jobs handle work that outlives the request. Broadcasts push updates to the browser that it never asked for.
 
 ## Declaring a task
 
@@ -17,9 +19,13 @@ def send_welcome_email(uid: str, email: str) -> None:
     send(to=email, template="welcome", uid=uid)
 ```
 
-Every non-underscore top-level function in `app/jobs/*.py` becomes a submittable task, the same directory-walking discovery that finds `app/remote/*.py` functions and `app/broadcasts/*.py` channels. `@task` doesn't change what gets discovered, an undecorated function is registered exactly the same way, for backward compatibility. What it changes is the warning: an undecorated top-level function logs a one-line deprecation-style notice suggesting `@task` be added, since a helper that happens to be public and top-level becoming submittable by accident is an easy mistake in a file meant to stay a thin registry. Real implementation belongs in `app/support/`, underscore-prefix anything in `app/jobs/*.py` that isn't meant to be a task entry point.
+Every function you define at the top level of a job file becomes a task, as long as its name doesn't start with an underscore. Fymo finds it through the same discovery that picks up remote functions and broadcast channels: it just walks the directory.
 
-Task names must be unique across every `app/jobs` module. Two modules defining `send_welcome_email` is a startup error, not a silent overwrite, the same rule broadcast channel names follow.
+Adding `@task` doesn't change what gets discovered. An undecorated function is still registered as a task, purely for backward compatibility. What changes is a warning: leave it off and fymo logs a note suggesting you add it.
+
+That warning exists because job files are meant to stay thin. It's easy to write a small helper, forget it's public and top-level, and have it accidentally become submittable. Keep real logic in your support modules, and underscore-prefix any helper in a job file that isn't meant to be a task.
+
+Task names must be unique across every job module. If two modules both define `send_welcome_email`, fymo raises a startup error instead of silently overwriting one. Broadcast channel names follow the same rule.
 
 ## Submitting a job
 
@@ -33,20 +39,26 @@ def register(email: str, password: str) -> None:
     get_job_provider().submit("send_welcome_email", uid=uid, email=email)
 ```
 
-`submit()` is fire-and-forget: no return value, no blocking, the request that called it returns immediately. Nothing here tracks progress or result either, the task itself is responsible for persisting whatever outcome it needs (a database row, say), because nothing surfaces success or failure back to the code that submitted it. A poller or the task's own side effects are what the rest of the app reads from afterward.
+Calling `submit()` is fire-and-forget. It returns nothing, blocks nothing, and the request that called it moves on immediately.
+
+Nothing tracks progress or result for you. If a task needs to report an outcome, it has to persist that itself, a database row is the usual choice. The rest of your app reads that outcome later, either through a poller or through the task's own side effects.
 
 ## Choosing a job provider
 
-A `JobProvider` contributes exactly two things the framework calls: `register_tasks()` at startup, wiring every discovered `app/jobs` function into whatever the provider uses internally, and `submit()`, which enqueues a call to run in the background. Two providers ship built in.
+A job provider is a small interface with two jobs of its own. At startup, it wires every discovered task into whatever it uses internally. When you call `submit()`, it enqueues that call to run in the background. Two providers ship with fymo out of the box.
 
 | Provider | Where it runs | Durability | Needs |
 |---|---|---|---|
 | `threaded` (default) | In-process thread pool | Dies if the process restarts mid-run | nothing extra |
 | `procrastinate` | A separate `fymo jobs-worker` process | Survives a restart, scales independently of the web tier | Postgres (`DATABASE_URL`), `pip install fymo[procrastinate]` |
 
-`threaded` wraps the same in-process `JobRunner` fymo has always had: a bounded `ThreadPoolExecutor`, three workers by default, one bad task can't take down the pool or the request that submitted it. It's the fallback when `jobs.provider` is unset in `fymo.yml`, the same role `password` plays for auth.
+The threaded provider wraps fymo's in-process job runner: a bounded thread pool with three workers by default. One bad task can't take down the pool, or the request that submitted it.
 
-`procrastinate` is a Postgres-native durable queue. A submitted job is a row, so it survives a web-process restart and gets picked up by whichever `fymo jobs-worker` process is listening, possibly several of them. Reusing the app's own database is fine, procrastinate keeps its state in its own tables.
+It's the fallback when `jobs.provider` is unset in `fymo.yml`. That mirrors the role `password` plays for auth, the default you get for free.
+
+The procrastinate provider is a Postgres-native durable queue. A submitted job becomes a row, so it survives a restart of the web process. Whichever `fymo jobs-worker` process is listening picks it up, and you can run several of them.
+
+You can reuse your app's own database for this. Procrastinate keeps its state in its own tables, so it won't collide with yours.
 
 ```yaml
 # fymo.yml
@@ -55,12 +67,16 @@ jobs:
 ```
 
 <Note>
-Both providers route actual execution through the same lifecycle wrapper: one log line at started, succeeded, or failed, with duration. Job arguments are deliberately never logged, only the task name, status, and timing, so a job carrying sensitive input doesn't leak it into the log stream.
+Both providers log the same way: one line when a task starts, succeeds, or fails, with duration. Job arguments are never logged, only the task name, status, and timing, so sensitive input never leaks into your logs.
 </Note>
 
 ## Running a worker
 
-`threaded` has no separate worker, `submit()` already ran the task by the time it returns. `procrastinate` does: `fymo jobs-worker` starts a process that opens its own connection, registers every discovered task, and blocks, picking up jobs as they're deferred. Calling `run_worker()` on a provider that doesn't back a durable queue raises, `threaded` has nothing for it to do.
+The threaded provider has no separate worker to run. By the time `submit()` returns, the task has already run.
+
+Procrastinate does need one. Running `fymo jobs-worker` starts a process that opens its own database connection, registers every discovered task, and blocks, picking up jobs as they get deferred.
+
+Calling `run_worker()` on a provider that isn't a durable queue raises an error. The threaded provider simply has nothing for it to do.
 
 ## Declaring a channel
 
@@ -85,7 +101,11 @@ def post_activity(slug: str) -> PostActivity:
         raise NotFound(f"post '{slug}' not found")
 ```
 
-A channel is one function in `app/broadcasts/*.py`, discovered the same way jobs are, non-underscore top-level functions only, names unique across modules. Three things are read off that one function: the signature is the subscribe-time arguments, the return annotation is the payload type (checked against what actually gets published, in dev mode), and the body is the subscribe-time authorization guard. It runs on every SSE subscribe attempt, inside the same request scope remote functions get, so `current_user()` and friends work normally inside it. Returning exactly `False`, or raising, rejects the subscription; anything else, including a bare `...` body, allows it.
+A channel is just one function in a broadcasts file. It's discovered the same way tasks are: non-underscore top-level functions only, with names unique across modules.
+
+Three things come off that single function. Its signature defines the arguments a client passes when it subscribes. Its return annotation defines the payload type, and in dev mode fymo checks that against what you actually publish. Its body is the authorization guard.
+
+That guard runs on every subscribe attempt, inside the same request scope remote functions get. So `current_user()` and anything like it works normally inside it. Return exactly `False`, or raise, and fymo rejects the subscription. Anything else, including a bare `...` body, allows it.
 
 ## Publishing events
 
@@ -99,9 +119,15 @@ def _publish_activity(slug: str, kind: str, **payload) -> None:
         logger.warning("post_activity broadcast failed for %s", slug, exc_info=True)
 ```
 
-`publish(channel, data=None, **args)` takes two different kinds of arguments on purpose. `args` must match the channel function's own signature, they select *which* subscribers receive the event, `slug="my-post"` only reaches subscribers who opened that exact channel with that exact `slug`. `data` is *what* gets sent, JSON-encoded straight onto the wire as an SSE frame. Like job submission, publishing is fire-and-forget: no subscribers means the payload is simply dropped, not an error, which is why the blog example wraps it in a `try`/`except` rather than letting a broadcast hiccup fail the comment it's reporting on.
+Publishing takes two different kinds of arguments on purpose. The keyword arguments you pass select *which* subscribers receive the event, and they have to match the channel function's own signature. Passing `slug="my-post"` only reaches subscribers who opened that exact channel with that exact slug.
 
-In dev mode, `publish()` checks `data` against the channel's declared `TypedDict` return type and logs a warning if a required key is missing or an unrecognized one shows up. It never blocks delivery, this is a development-time nudge, not a runtime contract.
+The `data` argument is different: it's *what* gets sent, JSON-encoded straight onto the wire as an SSE frame.
+
+Publishing is fire-and-forget, just like job submission. No subscribers means the payload is simply dropped, not an error. That's why the example above wraps the call in a try/except block, so a broadcast hiccup never fails the comment it's reporting on.
+
+In dev mode, publishing checks your data against the channel's declared return type. It logs a warning if a required key is missing, or if an unexpected one shows up.
+
+This never blocks delivery. It's a development-time nudge, not a runtime contract.
 
 ## Subscribing from Svelte
 
@@ -119,7 +145,9 @@ In dev mode, `publish()` checks `data` against the channel's declared `TypedDict
 </script>
 ```
 
-Every `app/broadcasts` module gets its own generated `.js`/`.d.ts` pair under `$broadcast/<module>`, mirroring how `$remote` codegen works for remote functions. The generated types come straight from the channel function: its parameters become the typed `args` object, its return annotation becomes the payload type passed to the callback.
+Every broadcasts module gets its own generated file pair, mirroring how the `$remote` codegen works for remote functions. You import from `$broadcast/<module>`.
+
+The generated types come straight from the channel function. Its parameters become the typed `args` object, and its return annotation becomes the payload type passed to your callback.
 
 ```typescript
 // generated: $broadcast/posts.d.ts
@@ -133,18 +161,30 @@ export const subscribe: {
 };
 ```
 
-Under the hood `subscribe.post_activity(...)` just opens an `EventSource` against `/_fymo/broadcast/posts/post_activity?slug=...` and parses each `data:` frame as JSON. `EventSource` reconnects on its own after a transient drop, that's browser behavior, not anything fymo adds. A subscription the server actively rejects (guard returned `False`, unknown channel) closes for good instead, matching the fire-and-forget contract on the publish side: the subscription is just over.
+Under the hood, `subscribe.post_activity(...)` opens a standard `EventSource` connection and parses each frame as JSON.
+
+It connects to a URL shaped like `/_fymo/broadcast/posts/post_activity?slug=...`, generated for you automatically.
+
+That reconnect-on-drop behavior comes from the browser's `EventSource`, not from anything fymo adds. A subscription the server actively rejects, say the guard returned `False`, or the channel doesn't exist, closes for good instead. That matches the fire-and-forget contract on the publish side: the subscription is just over.
 
 ## How a subscription resolves
 
-The server-side handler resolves `<module>/<channel>` from the discovery registry, binds the query string against the channel function's signature (a mismatch is a 422, not a crash), runs the function body as the guard (a rejection is a 403), then hashes the module, channel name, and bound arguments into a channel key. That key is what the broadcast provider actually listens on, so two subscribers calling `post_activity` with different `slug` values never see each other's events, they're on different keys entirely even though they hit the same channel function.
+Here's what happens when a subscription comes in. The server resolves `<module>/<channel>` from the discovery registry, then binds the query string against the channel function's signature. A mismatch there is a 422, not a crash.
+
+Next it runs the function body as the guard. A rejection there is a 403. Finally it hashes the module, channel name, and bound arguments together into a channel key.
+
+That key is what the broadcast provider actually listens on. Two subscribers calling `post_activity` with different `slug` values never see each other's events, even though they hit the same channel function, they're just on different keys.
 
 <Warning>
-Each open SSE connection holds a thread for its lifetime. That's fine on the threaded dev server and on gunicorn's `gthread` worker class, but it will starve a sync worker pool under any real subscriber load.
+Each open SSE connection holds a thread for its lifetime. That's fine on the threaded dev server and on gunicorn's `gthread` worker class, but it can starve a sync worker pool under real subscriber load.
 </Warning>
 
 ## Broadcast transport
 
-The default `PostgresBroadcastProvider` uses `LISTEN`/`NOTIFY`, the same primitive procrastinate itself uses for near-instant job pickup, so it needs nothing beyond the Postgres database a fymo app already has. It works across separate OS processes: a `fymo jobs-worker` process can `NOTIFY` and a web worker holding a matching `LISTEN` picks it up, which is how a background job ends up updating a page in real time.
+The default broadcast provider runs on Postgres, using the same `LISTEN`/`NOTIFY` primitive procrastinate uses for near-instant job pickup. It needs nothing beyond the Postgres database your fymo app already has.
 
-Postgres caps a `NOTIFY` payload at 8000 bytes, and the provider enforces that loudly at publish time rather than truncating silently. Broadcasts are meant to carry ids and small state, publish an id and let the subscriber fetch the rest, not the blob itself.
+<Accordion title="How the Postgres transport works">
+It works across separate OS processes. A `fymo jobs-worker` process sends the notify. A web worker holding a matching listen picks it up. That's how a background job ends up updating a page in real time.
+
+Postgres also caps a `NOTIFY` payload at 8000 bytes. The provider enforces that loudly at publish time instead of truncating silently. Keep broadcasts small: publish an id and let the subscriber fetch the rest, not the whole blob.
+</Accordion>

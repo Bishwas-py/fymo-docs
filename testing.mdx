@@ -3,9 +3,9 @@ title: Testing
 description: How the framework's own test suite is organized, and how to run it.
 ---
 
-Fymo's test suite lives under `tests/` and mirrors the shape of the `fymo/` package: each top-level module gets its own test directory, plus one extra directory for tests that cross module boundaries. As of this writing the suite has 108 `test_*.py` files.
+Fymo's test suite lives under `tests/` and mirrors the shape of the `fymo/` package. Each top-level module gets its own test directory, plus one extra directory for tests that cross module boundaries. As of this writing, the suite has 108 `test_*.py` files.
 
-Two example apps under `examples/` (`todo_app` and `blog_app`) double as test fixtures. `blog_app` has real `app/remote/*.py` functions and auth enabled, so it's the one integration tests reach for when they need to exercise remote-function discovery, SSR, or a full request/response cycle.
+Two example apps live in the examples folder and double as test fixtures: a simple `todo_app` and a fuller `blog_app`. `blog_app` has real `app/remote/*.py` functions with auth turned on. That's why integration tests reach for it to exercise remote-function discovery, SSR, or a full request/response cycle.
 
 ## Directory layout
 
@@ -22,7 +22,7 @@ Two example apps under `examples/` (`todo_app` and `blog_app`) double as test fi
 | `tests/storage` | `fymo/storage` | storage provider registry and the local provider |
 | `tests/integration` | (none, cross-cutting) | full request/response cycles against `todo_app` and `blog_app`, exercising build, routing, auth, and remote calls together |
 
-Provider-heavy modules (`broadcast`, `jobs`) additionally split provider-specific tests into a `providers/` subdirectory, so `tests/jobs/providers/test_procrastinate.py` sits next to `tests/jobs/test_job_runner.py` rather than everything living flat in one file.
+Modules with multiple providers, like broadcast and jobs, split provider-specific tests into their own `providers/` subdirectory. That keeps `tests/jobs/providers/test_procrastinate.py` next to `tests/jobs/test_job_runner.py` instead of everything living flat in one folder.
 
 ## Naming and config
 
@@ -37,41 +37,43 @@ python_functions = ["test_*"]
 norecursedirs = ["*.egg", ".*", "_darcs", "CVS", "dist", "node_modules", "venv", "{arch}"]
 ```
 
-A file has to be named `test_*.py` and live under `tests/` to be collected. Most of the suite is plain functions (`test_*`), not classes, though `Test*` classes are picked up too if you use them. `tests/__init__.py` exists so integration tests can import helpers with a plain `from tests.integration._seed_helpers import seed_test_post`.
+To get collected, a file must be named `test_*.py` and live under `tests/`. Most tests are plain functions matching `test_*`, though `Test*` classes work too if you prefer them. A `tests/__init__.py` file lets integration tests import helpers directly, for example `from tests.integration._seed_helpers import seed_test_post`.
 
 ## Running tests
 
-The project uses `uv`, so the full suite runs with:
+The project uses `uv`, so you can run the full suite with:
 
 ```bash
 uv run pytest tests/ -v
 ```
 
-which is exactly what CI does (`.github/workflows/ci.yml`). To run everything in one module:
+That's the exact command CI runs too, defined in `.github/workflows/ci.yml`.
+
+Narrow things down when you only care about one part of the suite. Run everything in a module:
 
 ```bash
 uv run pytest tests/core/
 ```
 
-a single file:
+Run a single file:
 
 ```bash
 uv run pytest tests/core/test_html.py
 ```
 
-or a single test:
+Or run a single test:
 
 ```bash
 uv run pytest tests/core/test_html.py::test_minimal_html_structure
 ```
 
 <Note>
-Fixtures that copy `examples/todo_app` or `examples/blog_app` skip with a clear message if that example's `node_modules` isn't installed yet. Run `npm install` inside the example directory first if you see those skips.
+Some fixtures copy an example app, either `todo_app` or `blog_app`, before running tests against it. If that example's `node_modules` folder isn't installed yet, the fixture skips with a clear message instead of failing. Run `npm install` inside the example directory first if you see one of those skips.
 </Note>
 
 ## Unit vs integration
 
-Most of the suite is unit tests: one test file per source module, asserting on that module's behavior in isolation. `tests/core/test_html.py` is a representative example, it calls `build_html()` directly with hand-built `RouteAssets` and checks the returned markup, without spinning up a server or a build pipeline.
+Most of the suite is made up of unit tests: one test file per source module, checking that module's behavior in isolation. `tests/core/test_html.py` is a good example of this pattern. It calls `build_html()` directly with a hand-built `RouteAssets` object and checks the markup that comes back, without spinning up a server or a build pipeline.
 
 ```python
 def test_minimal_html_structure():
@@ -93,29 +95,43 @@ def test_minimal_html_structure():
     assert '<link rel="stylesheet" href="/dist/client/todos.A1B2.css">' in html
 ```
 
-`tests/integration/` is where several layers run together against a real example app: `fymo build` runs for real, a WSGI request goes through the actual app, and a remote call round-trips through the devalue wire format. `tests/integration/test_blog_e2e.py` builds `blog_app`, then drives it with a small `_wsgi_call()` helper that constructs a WSGI environ dict and collects the response, no test client library involved. In one test it renders the index page, renders a post detail page, calls the `get_posts` remote function, confirms an anonymous `create_comment` is rejected with a 401, signs up through the generated auth client, and then confirms the authenticated `create_comment` succeeds with the author taken from the session rather than client input.
+The `tests/integration/` directory is different: it runs several layers together against a real example app. A `fymo build` runs for real, a WSGI request goes through the actual app, and a remote call round-trips through the devalue wire format.
 
-Because integration tests need a real SQLite row to render against, `tests/integration/_seed_helpers.py` exposes `seed_test_post()`, which inserts a post directly via `app.data.db`, bypassing markdown parsing entirely. It replaced an older markdown-file seeder; call it after the `blog_app` fixture has put the example on `sys.path`, and before building or hitting the app.
+`tests/integration/test_blog_e2e.py` is the best walkthrough of this. It builds `blog_app`, then drives it with a small `_wsgi_call()` helper. That helper constructs a WSGI environ dict and collects the response, with no test client library involved.
 
-## Fixtures
+One test in that file exercises a full user journey. It renders the index page and a post detail page, then calls the `get_posts` remote function. It confirms an anonymous `create_comment` call is rejected with a 401. Then it signs up through the generated auth client, and confirms the authenticated `create_comment` call succeeds, with the author taken from the session rather than from client input.
+
+Integration tests need a real SQLite row to render against. `tests/integration/_seed_helpers.py` exposes a `seed_test_post()` helper. It inserts a post directly via `app.data.db`, skipping markdown parsing entirely.
+
+This helper replaced an older markdown-file seeder. Call it after the `blog_app` fixture has put the example on `sys.path`, and before building or hitting the app.
+
+## Test fixtures
 
 `tests/conftest.py` defines the fixtures shared across the suite:
 
 <CardGroup cols={2}>
   <Card title="example_app / blog_app" icon="copy">
-    Copy `examples/todo_app` or `examples/blog_app` into an isolated `tmp_path`, symlinking `node_modules` from the original so setup stays fast. `blog_app` also inserts the copy onto `sys.path` and cleans up both `sys.path` and the cached `app.*` modules afterward, since every copy shares the top-level package name `app`.
+    Copies an example app into an isolated `tmp_path` so tests don't share state. It works for both `todo_app` and `blog_app`. The original `node_modules` folder gets symlinked in rather than copied, which keeps setup fast.
+
+    For `blog_app`, the fixture also places the copy on `sys.path`. Afterward it cleans up both `sys.path` and any cached `app.*` modules. That matters because every copy shares one top-level package name: `app`.
   </Card>
   <Card title="node_available" icon="hexagon-check">
-    Session-scoped, skips a test if `node` isn't on `PATH`. Used by anything that needs the SSR sidecar or a real `fymo build`.
+    Session-scoped. Skips a test automatically if `node` isn't available on `PATH`. Used by anything that needs the SSR sidecar or a real `fymo build`.
   </Card>
   <Card title="_fymo_secret_for_tests" icon="key">
-    Autouse, session-scoped. Sets `FYMO_SECRET` so a `FymoApp` can be constructed without each test setting `dev=True` or managing a `.fymo/secret.key` file.
+    Autouse and session-scoped. Sets `FYMO_SECRET` so a `FymoApp` can be constructed without extra setup. Individual tests don't need to set `dev=True` or manage a `.fymo/secret.key` file themselves.
   </Card>
   <Card title="_reset_remote_router_globals" icon="rotate">
-    Autouse. `FymoApp.__init__` writes `_explicit_optin` and `_dev_mode` directly onto the `fymo.remote.router` module, so this fixture resets both to `False` after every test, preventing a test that builds over `blog_app` (which sets `remote.explicit_optin: true`) from leaking that setting into unrelated tests running later in the same process.
+    Autouse. `FymoApp.__init__` writes directly onto the `fymo.remote.router` module. It sets two flags there, `_explicit_optin` and `_dev_mode`. This fixture resets both back to `False` after every test.
+
+    Without it, a test that builds over `blog_app`, which sets `remote.explicit_optin: true`, could leak that setting into unrelated tests running later in the same process.
   </Card>
 </CardGroup>
 
-<Warning>
-The `blog_app` fixture's `sys.path` and `sys.modules` cleanup exists for a specific reason: without it, a second test using a different `tmp_path` copy of `blog_app` would silently reuse the first test's cached `app.data.db` module, and `seed_test_post()` would write into the wrong SQLite file. If you add a fixture that imports from `app.*`, follow the same cleanup pattern.
-</Warning>
+<Accordion title="A subtle bug this cleanup prevents">
+This cleanup exists to guard against a specific bug. Without it, two tests using separate copies of `blog_app` could collide.
+
+The second test would silently reuse the first test's cached `app.data.db` module instead of its own. That means `seed_test_post()` could write into the wrong SQLite file, the one belonging to the other test.
+
+If you write a fixture that imports from `app.*`, follow this same cleanup pattern.
+</Accordion>

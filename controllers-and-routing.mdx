@@ -18,11 +18,13 @@ def getDoc():
     return {"title": "Post"}
 ```
 
-That controller pairs with `app/templates/posts/show.svelte`. The router resolves a request path to a controller and an action, imports `app/controllers/<controller>.py`, calls `getContext()` with whatever route params it accepts, and hands the result to the matching `.svelte` file as props. `getDoc()` supplies the page title and `<head>` content alongside it.
+That controller pairs with a template at `app/templates/posts/show.svelte`. Here's the flow: the router resolves a request path to a controller and an action, then imports the matching file from `app/controllers/`.
+
+It calls `getContext()` with whatever route params that function accepts, and the return value becomes the props for the matching `.svelte` file. `getDoc()` runs alongside it, supplying the page title and `<head>` content.
 
 ## Route matching
 
-Routes come from `fymo.yml`. A `root` entry and a list of `resources` are the common case:
+Routes come from `fymo.yml`. A `root` entry and a list of `resources` cover the common case:
 
 ```yaml fymo.yml
 routes:
@@ -43,15 +45,22 @@ routes:
 
 An app doesn't have to define every one of these templates, only the ones it actually renders. The blog example only ships `posts/show.svelte`, so `/posts` and the others simply aren't reachable in that app.
 
-`Router.match()` tries an exact path match first, then patterns with `:param` segments, then falls back to convention-based routing for anything not declared explicitly: `/controller` resolves to `controller.index`, and `/controller/action` resolves to `controller.action`. This is what makes `/` route to `home.index` (or whatever `root:` points at) without a resource entry for it.
+`Router.match()` checks routes in order: an exact path match first, then a pattern with a `:param` segment, and finally a convention-based fallback for anything not declared explicitly. The fallback covers two shapes:
+
+| Path shape | Resolves to |
+|---|---|
+| `/controller` | `controller.index` |
+| `/controller/action` | `controller.action` |
+
+That same fallback is how a bare slash route resolves to `home.index`, or whatever the config's `root:` entry points at, with no separate resource entry needed.
 
 <Note>
-`Router.add_route()` lets an app register a path directly instead of going through `resources`, for routes that don't fit the RESTful shape.
+`Router.add_route()` lets an app register a path directly, without going through `resources`, for routes that don't fit the RESTful shape.
 </Note>
 
 ## Route params
 
-Segments written as `:id` in a route pattern are captured by name and passed to `getContext()` as keyword arguments, filtered down to whatever the function's signature actually declares:
+A segment like `:id` in a route pattern gets captured by name. Fymo passes it to `getContext()` as a keyword argument, filtered down to whatever the function actually declares in its signature:
 
 ```python app/controllers/posts.py
 def getContext(id: str = ""):
@@ -59,11 +68,22 @@ def getContext(id: str = ""):
     ...
 ```
 
-Extra params in the match that `getContext()` doesn't accept are dropped rather than raising a `TypeError`. `fymo/core/ssr_controller.py`'s `load_controller_context()` does this filtering with `inspect.signature`, and it's the same helper both the full-page render and the soft-nav data endpoint call, so params behave identically on first load and on client-side navigation.
+Extra params in the match that `getContext()` doesn't accept are simply dropped, instead of raising a `TypeError`.
+
+<Note>
+This filtering happens in `fymo/core/ssr_controller.py`, in a helper called `load_controller_context()`. It uses `inspect.signature` under the hood, and both the full page render and the soft nav data endpoint call the same helper. That's why params behave identically whether it's the first load or a client-side navigation.
+</Note>
 
 ## getContext and getDoc
 
-A controller module can export two functions, both optional. `getContext(**params)` returns a dict that becomes the template's props (`$props()` in the Svelte component). It can return values that aren't plain JSON, including remote functions imported from `app/remote/*`, which get serialized as callable markers the client resolves through `$remote`. `getDoc()` returns a dict of page metadata: `title` for the `<title>` tag, and an optional `head` dict with `meta` and `link` lists for `<meta>`/`<link>` tags.
+A controller module can export two functions, both optional. `getContext(**params)` returns a dict that becomes the template's props, available as `$props()` in the Svelte component.
+
+It can return more than plain JSON. Values can include remote functions imported from `app/remote/*`, which get serialized as callable markers that the client resolves through `$remote`.
+
+`getDoc()` returns a dict of page metadata:
+
+- `title` sets the `<title>` tag.
+- An optional `head` dict can include `meta` and `link` lists, which become `<meta>` and `<link>` tags.
 
 ```python app/controllers/index.py
 def getContext():
@@ -77,9 +97,9 @@ def getDoc():
     }
 ```
 
-Neither function is required. A controller with no `getContext()` renders its template with no props; one with no `getDoc()` falls back to the app's configured name as the title.
+Neither function is required. A controller with no `getContext()` just renders its template with no props. A controller with no `getDoc()` falls back to the app's configured name as the title.
 
-When auth is enabled, both functions run inside a read-only request scope, so `current_user()` resolves the session cookie during SSR itself rather than only after the client hydrates. That scope is opened the same way for a full-page render and for a soft-nav data fetch, which is what keeps a logged-in user from flashing as logged-out on client-side navigation.
+When auth is enabled, both functions run inside a read-only request scope. This lets `current_user()` resolve the session cookie during server-side rendering itself, not just after the client hydrates. Fymo opens this same scope for both a full page render and a soft nav data fetch. That's what keeps a logged-in user from flashing as logged out during client-side navigation.
 
 ## Layouts
 
@@ -94,11 +114,28 @@ An optional `app/templates/_layout.svelte` wraps every route in the app, and an 
 {@render children()}
 ```
 
-Each `_layout.svelte` can be paired with a same-path `_layout.py` controller (`app/controllers/_layout.py` for the root, `app/controllers/<resource>/_layout.py` for a resource) that exports its own `getContext()`/`getDoc()`, invoked the same way a page controller is. A route with no layout files gets flat props, exactly what its own `getContext()` returned. A route with a layout chain gets nested props instead: `{ leafProps, layoutProps: { root, resource } }`, and its head metadata is the result of merging every level's `getDoc()`, root first, then resource, then the leaf. Scalar keys like `title` are overridden by the more specific level; `head.meta` and `head.link` arrays concatenate instead, so a leaf's page-specific `<meta>` tags add to the root layout's defaults rather than replacing them.
+Each `_layout.svelte` can be paired with a matching `_layout.py` controller. The path depends on the level:
+
+- Root layout controller: `app/controllers/_layout.py`
+- Resource layout controller: `app/controllers/<resource>/_layout.py`
+
+That controller exports its own `getContext()` and `getDoc()`, called the same way as a page controller.
+
+A route with no layout files just gets flat props, whatever its own `getContext()` returned. A route with a layout chain gets nested props instead, combining the layout's data with the page's.
+
+<Accordion title="How layout props and metadata merge">
+When a route has a layout chain, its props come nested rather than flat: `{ leafProps, layoutProps: { root, resource } }`.
+
+Head metadata merges too, starting from the root layout, then the resource layout, then the leaf page. Scalar keys like `title` get overridden by the more specific level, so the leaf's title wins.
+
+`head.meta` and `head.link` arrays work differently: they concatenate instead of replacing. A leaf's page-specific `<meta>` tags add to the root layout's defaults, rather than replacing them.
+</Accordion>
 
 ## Soft navigation
 
-By default, clicking between routes in a Fymo app doesn't trigger a full page reload. The client fetches `GET /_fymo/data/<path>`, which resolves the same route, runs the same controller and layout chain, and returns the next page's props, doc metadata, and bundle URLs as a devalue-encoded payload. The client swaps in the new leaf (and layout, if it changed) without tearing down the page.
+By default, clicking between routes in a Fymo app skips the full page reload. The client fetches `GET /_fymo/data/<path>` instead, which resolves the same route and runs the same controller and layout chain as a normal page load.
+
+That request returns the next page's props, doc metadata, and bundle URLs, packed into a devalue-encoded payload. The client swaps in the new leaf, and the layout too if it changed, without tearing down the rest of the page.
 
 <Tip>
 A resource can opt out of soft navigation per route, forcing full page reloads for it instead:
@@ -112,4 +149,8 @@ routes:
 ```
 </Tip>
 
-`Router.soft_nav_enabled(controller)` defaults to `True` for any controller not explicitly listed. If a stale client still hits `/_fymo/data/admin` after `soft_nav: false`, the endpoint answers with a `409 soft_nav_disabled` error instead of serving the data, since the resource is meant to always take a full reload.
+<Accordion title="What happens when a stale client still asks for soft nav data">
+`Router.soft_nav_enabled(controller)` defaults to true for any controller not listed with `soft_nav: false`.
+
+If a browser tab was already open before soft nav got disabled, it might still request `/_fymo/data/admin`. Fymo answers with a `409 soft_nav_disabled` error instead of serving data, since that resource always wants a full reload.
+</Accordion>

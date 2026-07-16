@@ -3,29 +3,39 @@ title: Quickstart
 description: Install Fymo and run your first project.
 ---
 
-## Install
+Let's get you from zero to a running app in about five minutes.
 
+<Steps>
+<Step title="Install Fymo">
 ```bash
 pip install fymo
 ```
+</Step>
 
-## Create a project
-
+<Step title="Create a project">
 ```bash
 fymo new my-app
 cd my-app
 npm install
 ```
 
-## Run it
+This scaffolds a new project for you and installs its frontend dependencies.
+</Step>
 
+<Step title="Run it">
 ```bash
 fymo dev
 ```
 
-Visit `http://127.0.0.1:8000` and you should see your new app running.
+Open `http://127.0.0.1:8000` in your browser. You should see your new app running.
+</Step>
+</Steps>
+
+That's it, you have a real Fymo app running on your machine.
 
 ## Project structure
+
+Here's what `fymo new` just set up for you:
 
 ```
 my-app/
@@ -42,9 +52,11 @@ my-app/
 └── server.py               # Entry point
 ```
 
-See [the app/ directory](/app-directory) for what belongs in each folder.
+See [the app/ directory](/app-directory) to learn what belongs in each folder.
 
 ## A minimal page
+
+Every page in Fymo pairs a Python controller with a Svelte template. Here's the smallest one you can write.
 
 ```python
 # app/controllers/home.py
@@ -66,3 +78,5 @@ def getContext():
 <p>{message}</p>
 <button onclick={() => count++}>Count: {count}</button>
 ```
+
+The controller returns data, and the template renders it. That's the whole loop, and everything else in Fymo builds on it.

@@ -3,13 +3,13 @@ title: Development Setup
 description: Clone the framework, install its Python and Node dependencies, and run a bundled example app against your local checkout.
 ---
 
-This page is for contributors working on the fymo framework itself (the `fymo/` package, its CLI, its build pipeline). If you're building an application with fymo, see the [quickstart](/quickstart) instead.
+This page is for anyone contributing to the fymo framework itself, meaning the `fymo/` package, its CLI, and its build pipeline. If you're building an application with fymo instead, head over to the [quickstart](/quickstart).
 
 ## Prerequisites
 
-- Python 3.11 or newer (`pyproject.toml` sets `requires-python = ">=3.11"`)
-- Node.js 20 or newer (the bundler shells out to esbuild, and the SSR sidecar runs on Node)
-- [uv](https://docs.astral.sh/uv/) is what the project's own CI uses, but a plain `pip` + `venv` workflow works too
+- Python 3.11 or newer, since `pyproject.toml` sets `requires-python = ">=3.11"`
+- Node.js 20 or newer. The bundler shells out to esbuild, and the SSR sidecar runs on Node
+- [uv](https://docs.astral.sh/uv/), which the project's own CI uses, though a plain `pip` and `venv` workflow works fine too
 
 <Steps>
   <Step title="Clone the repo">
@@ -20,15 +20,15 @@ This page is for contributors working on the fymo framework itself (the `fymo/` 
   </Step>
 
   <Step title="Install Python dependencies">
-    With `uv`:
+    With uv:
 
     ```bash
     uv sync
     ```
 
-    This installs the `fymo` package itself in editable mode, plus the `dev` dependency group declared in `pyproject.toml`: `pytest`, `pytest-asyncio`, and `pydantic`.
+    This installs fymo itself in editable mode, plus the dev dependencies from `pyproject.toml`: pytest, pytest-asyncio, and pydantic.
 
-    Without `uv`, a virtualenv and an editable install cover the same ground:
+    Prefer a plain virtualenv? This covers the same ground:
 
     ```bash
     python3 -m venv .venv
@@ -43,7 +43,7 @@ This page is for contributors working on the fymo framework itself (the `fymo/` 
     npm install
     ```
 
-    The root `package.json` declares `svelte` and `devalue` as runtime dependencies, and `esbuild`, `esbuild-svelte`, `jsdom`, `svelte-preprocess`, and `typescript` as dev dependencies. These are what the framework's own build and test code (`fymo/build/js`) shells out to.
+    The root `package.json` declares svelte and devalue as runtime dependencies, and esbuild, esbuild-svelte, jsdom, svelte-preprocess, and typescript as dev dependencies. These are what the framework's own build and test code, under `fymo/build/js`, shells out to.
   </Step>
 
   <Step title="Run the test suite">
@@ -51,22 +51,24 @@ This page is for contributors working on the fymo framework itself (the `fymo/` 
     uv run pytest tests/
     ```
 
-    Or, without `uv`, with your virtualenv active:
+    Or, without uv, with your virtualenv active:
 
     ```bash
     pytest tests/
     ```
 
-    Tests are collected from `tests/`, following the `test_*.py` naming convention set in `[tool.pytest.ini_options]`.
+    Tests live under `tests/`. Each file follows the `test_*.py` naming pattern, set in `pyproject.toml`.
   </Step>
 </Steps>
 
 ## Running an example app
 
-The repo ships two example apps under `examples/`: `blog_app` (remote functions, auth) and `todo_app` (a plain CRUD-style UI). Each has its own `package.json` and `requirements.txt`, since each is meant to be a standalone fymo project you could copy out of the repo.
+The repo ships two example apps under `examples/`. One is `blog_app`, which covers remote functions and auth; the other is `todo_app`, a plain CRUD-style UI. Each has its own `package.json` and `requirements.txt`, since it's meant to work as a standalone fymo project you could copy out of the repo.
 
 <Steps>
   <Step title="Install the example's npm dependencies">
+    Pick `blog_app` or `todo_app`, whichever you'd like to explore, then install its dependencies:
+
     ```bash
     cd examples/blog_app   # or examples/todo_app
     npm install
@@ -79,23 +81,23 @@ The repo ships two example apps under `examples/`: `blog_app` (remote functions,
     fymo serve
     ```
 
-    Or, for incremental rebuilds and browser reload while you work:
+    Or, if you'd like the browser to reload automatically as you edit, run `fymo dev` instead for incremental rebuilds.
 
-    ```bash
-    fymo dev
-    ```
-
-    Visit `http://127.0.0.1:8000`.
+    Visit `http://127.0.0.1:8000` to see it running.
   </Step>
 </Steps>
 
 <Note>
-  Both example apps' `requirements.txt` list `fymo>=0.1.0`, meant to be satisfied from PyPI for someone cloning just the example. Neither the example apps nor the project's CI workflows (`.github/workflows/ci.yml`) document a separate step that points an example app's own dependency resolution at your local checkout. In practice, if you run the example from the same environment `uv sync` created at the repo root, `python`/`fymo` resolve to the editable install of your working copy rather than a published release, because that's how an editable install works, not because the example is specially wired for it. If you set up the example in its own fresh virtualenv instead, you'll need your own editable install step (`pip install -e /path/to/fymo`) to see local changes reflected.
+  Both example apps list `fymo>=0.1.0` in their `requirements.txt`, which normally means pulling fymo from PyPI. Neither the example apps nor the CI workflows spell out a step for pointing that dependency at your local checkout instead.
+
+  In practice this tends to work out on its own. If you run an example from the same environment where you ran `uv sync` at the repo root, that environment already holds your editable install of fymo. So running `python` or `fymo` there picks up your working copy, not the published release, simply because that's how an editable install behaves.
+
+  If you set up an example in its own fresh virtual environment instead, you'll need to repeat that editable install yourself. Something like `pip install -e /path/to/fymo` will do it, so your local changes show up too.
 </Note>
 
 ## Commit messages
 
-CI checks that non-merge commit messages follow [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): description`, with `type` one of `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, or `revert`. This is enforced by the `lint` job in `.github/workflows/ci.yml` on every push to `main`.
+CI checks that every non-merge commit message follows Conventional Commits: `type(scope): description`. The type must be one of `feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert`. A lint job in `.github/workflows/ci.yml` enforces this on every push to main.
 
 <CardGroup cols={2}>
   <Card title="The app/ directory" icon="folder-tree" href="/app-directory">
