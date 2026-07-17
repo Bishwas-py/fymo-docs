@@ -78,6 +78,46 @@ Procrastinate does need one. Running `fymo jobs-worker` starts a process that op
 
 Calling `run_worker()` on a provider that isn't a durable queue raises an error. The threaded provider simply has nothing for it to do.
 
+<Tip>
+`fymo jobs-worker --dev` sets `FYMO_DEV=1` before anything else runs, which turns on `.env` loading. That matters here because `DATABASE_URL` usually lives in `.env` during development, not in `fymo.yml` itself.
+</Tip>
+
+## Checking job status
+
+```bash
+fymo jobs-status
+```
+
+`jobs-status` asks the configured provider two questions: how many jobs are in each status, and what the most recent ones are. It's read-only, meant for answering "is this job stuck" without hand-querying Postgres yourself.
+
+```
+Job status (procrastinate)
+  failed     6
+  succeeded  12
+
+Recent jobs (newest first, up to 10)
+  ID  TASK         STATUS   QUEUED AT
+  18  boom         failed   2026-07-16 10:02:11
+  ...
+```
+
+`-n`/`--limit` controls how many recent jobs print, 10 by default. `--dev` behaves exactly like `jobs-worker --dev`: it sets `FYMO_DEV=1` so `.env` loading kicks in before the provider reads `DATABASE_URL`.
+
+Not every provider can answer these questions. The threaded provider has no separate bookkeeping to read, since its jobs run and finish inside the same process that submitted them. A CLI invocation of `jobs-status` builds its own fresh provider a few milliseconds before asking it anything, and that fresh provider was never the web server that actually ran your jobs, so it has no way to see their outcomes. Rather than print confident zeros, it refuses:
+
+```
+✗ the 'threaded' job provider does not track job state — there is nothing
+  to report. Providers backed by a durable queue (e.g. 'procrastinate')
+  support `fymo jobs-status`; see docs/conventions.md for the app-level
+  progress convention.
+```
+
+That's an exit code of 1, not a crash. Procrastinate, backed by real Postgres tables, tracks state independently of any particular process and answers for real, as shown above.
+
+<Note>
+`job_counts()` and `list_recent_jobs()` are optional methods on the job provider interface. The base implementation returns `None` from both, which means "this provider doesn't track job state," distinct from an empty dict or list, which would mean "tracked, and there's nothing there yet." A custom provider you wrote before this surface existed doesn't need any changes: it already returns `None` for both by inheriting the base defaults, and `jobs-status` reports it as untracked rather than raising.
+</Note>
+
 ## Declaring a channel
 
 ```python
@@ -105,7 +145,7 @@ A channel is just one function in a broadcasts file. It's discovered the same wa
 
 Three things come off that single function. Its signature defines the arguments a client passes when it subscribes. Its return annotation defines the payload type, and in dev mode fymo checks that against what you actually publish. Its body is the authorization guard.
 
-That guard runs on every subscribe attempt, inside the same request scope remote functions get. So `current_user()` and anything like it works normally inside it. Return exactly `False`, or raise, and fymo rejects the subscription. Anything else, including a bare `...` body, allows it.
+That guard runs on every subscribe attempt, inside the same request scope remote functions get. So `current_uid()` and anything built on it works normally inside it. Return exactly `False`, or raise, and fymo rejects the subscription. Anything else, including a bare `...` body, allows it.
 
 ## Publishing events
 

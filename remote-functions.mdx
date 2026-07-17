@@ -41,14 +41,17 @@ def fn(x):  # ValueError at discovery time: please annotate parameter 'x'
     return x
 ```
 
-This "exposed by default" behavior is handy for small apps. But it also means a helper function living next to real endpoints in the same file becomes silently callable, unless you underscore-prefix it. If you'd rather opt in explicitly, set `remote.explicit_optin` in `fymo.yml`:
+This "exposed by default" behavior is handy for small apps, but it also means a helper function living next to real endpoints in the same file becomes silently callable, unless you underscore-prefix it. Fymo controls this with `remote.mode` in `fymo.yml`:
 
 ```yaml fymo.yml
 remote:
-  explicit_optin: true
+  mode: strict
 ```
 
-With that flag on, only functions decorated with `@remote` get discovered and dispatched. Everything else in the module is treated as a private helper, whether or not it's underscored:
+- `strict`: only functions decorated with `@remote` are discovered and dispatched. Everything else in the module is a private helper, whether or not it's underscored. There's nothing left for the build's hygiene check to flag, since anything undecorated is already unreachable.
+- `implicit-legacy`: every public, type-annotated function dispatches, the same behavior described above, and the hygiene check is silenced too. It exists as a migration aid for older projects and is explicitly unsafe as a long-term setting, not something to reach for on a new app.
+
+When `remote:` is absent from `fymo.yml` entirely, the default is implicit exposure, but the build still runs the hygiene check, and it fails if it finds an unmarked function that would be implicitly exposed. So the zero-config state isn't silently unsafe: it nudges you toward adding `@remote` markers or moving to `mode: strict` outright, rather than exposing everything with no warning. A freshly scaffolded app (`fymo new`) gets `mode: strict` set explicitly in its `fymo.yml`, so this default only comes up for projects that predate the setting or removed the line.
 
 ```python app/remote/posts.py
 from fymo.remote import remote
@@ -57,14 +60,18 @@ from fymo.remote import remote
 def get_posts() -> list[PostSummary]:
     ...
 
-def _format_summary(row):  # never reachable either way, opt-in or not
+def _format_summary(row):  # never reachable either way
     ...
 
-def helper_used_by_get_posts():  # NOT exposed once explicit_optin is on,
+def helper_used_by_get_posts():  # NOT exposed once mode is strict,
     ...                          # even without decoration
 ```
 
-The `@remote` decorator itself doesn't wrap or change the function, it just stamps `__fymo_remote__ = True` on it. With `explicit_optin` off (the default), the decorator does nothing for exposure, since everything is already exposed. It's still worth applying consistently, though, so a module reads the same way no matter which mode a project runs in.
+The `@remote` decorator itself doesn't wrap or change the function, it just stamps `__fymo_remote__ = True` on it. Under `implicit-legacy` or the zero-config default, the decorator does nothing for exposure, since everything is already exposed. It's still worth applying consistently, though, so a module reads the same way no matter which mode a project runs in.
+
+<Note>
+An older `explicit_optin`/`allow_implicit` boolean pair predates `remote.mode` and is still accepted as a deprecated fallback, but `remote.mode` is the interface to write against now. Setting `mode:` alongside either deprecated key is a configuration error, not a way to combine them.
+</Note>
 
 <Note>
 Discovery and the request router both call the same `is_exposed_remote_fn()` check, so what the generated client can reach and what the server will actually dispatch never drift apart.
@@ -140,6 +147,71 @@ A few more Python types round-trip too:
 
 On the way in, validation goes further than simple type coercion. If a parameter is typed as a `TypedDict`, a dataclass, a `NamedTuple`, or a Pydantic model, the incoming payload is checked against that exact shape instead of just being passed through.
 
+## Pagination helpers
+
+Fymo ships small pagination helpers for remote functions that return a list scoped to a page: `encode_cursor`, `decode_cursor`, and `paginate`, all importable from `fymo.remote`. The convention is fetch-limit-plus-one: query for one more row than the page size, then let `paginate` split that extra row off into a `next_cursor`.
+
+```python app/remote/posts.py
+from fymo.remote import remote, decode_cursor, paginate
+
+class PostsPage(TypedDict):
+    items: list[PostSummary]
+    next_cursor: str | None
+
+@remote
+def list_posts(cursor: str | None = None, limit: int = 20) -> PostsPage:
+    limit = max(1, min(limit, 50))
+    fields = "slug, title, summary, tags, published_at"
+    if cursor:
+        published_at, slug = decode_cursor(cursor, expect=2)
+        rows = get_db().fetchall(
+            f"SELECT {fields} FROM posts WHERE (published_at, slug) < (?, ?) "
+            "ORDER BY published_at DESC, slug DESC LIMIT ?",
+            [published_at, slug, limit + 1],
+        )
+    else:
+        rows = get_db().fetchall(
+            f"SELECT {fields} FROM posts ORDER BY published_at DESC, slug DESC LIMIT ?",
+            [limit + 1],
+        )
+    return paginate(rows, limit, key=lambda p: (p["published_at"], p["slug"]))
+```
+
+A cursor is opaque to the client. `encode_cursor` packs one or more sort-key values into base64url-encoded JSON, and `decode_cursor` reverses it. Sorting by `published_at` alone isn't safe here, since two posts can share a timestamp, so the cursor above carries `(published_at, slug)` together, and `decode_cursor(cursor, expect=2)` enforces that exact shape coming back in.
+
+Malformed input, anything from broken base64 to a tampered value outside JavaScript's safe integer range, raises a 400 `bad_cursor` error rather than a 500. A client never needs to parse or construct a cursor itself, it just passes back whatever `next_cursor` it was handed on the previous page.
+
+`paginate(rows, limit, key=...)` takes the rows you fetched (up to `limit + 1` of them), keeps the first `limit`, and, if an extra row came back, encodes that row's sort key as `next_cursor`. On the last page, `next_cursor` comes back `None`.
+
+## Rate limiting
+
+`@rate_limit(per_minute, scope="ip")` gives a single remote function its own token-bucket budget, separate from `limits.rate_limit`, the path-prefix limiter that already covers every request under `/_fymo/remote/`. Both stack: the middleware's budget still applies at the edge, and the per-function budget applies on top of it. That's useful when one function is expensive, an LLM call or a paid third-party API, while its module neighbors are cheap reads.
+
+```python app/remote/posts.py
+from fymo.remote import remote, rate_limit
+
+@remote
+@rate_limit(per_minute=5, scope="user")
+def generate_summary(slug: str) -> str:
+    ...
+```
+
+`scope` decides what counts as one caller:
+
+<CardGroup cols={3}>
+  <Card title="ip" icon="globe">
+    The client's resolved IP address. The default, and the only scope that doesn't depend on identity.
+  </Card>
+  <Card title="user" icon="user">
+    The uid from the `@identify` resolver chain, falling back to the verified `fymo_uid` cookie, then the IP.
+  </Card>
+  <Card title="uid" icon="fingerprint">
+    The verified `fymo_uid` cookie only, falling back to the IP when the cookie is missing or fails verification.
+  </Card>
+</CardGroup>
+
+A caller past their budget gets a `RateLimited` error, the same `RemoteError` machinery as `NotFound` or `Conflict` uses: status 429, code `rate_limited`, plus a `retry_after` field giving the number of seconds until the next attempt might succeed. There's no `fymo.yml` surface for this, the limit is configured right next to the function it protects.
+
 ## Error handling
 
 A remote function that raises propagates to the client as a structured error rather than a generic 500. Fymo defines a small hierarchy for this in `fymo.remote`:
@@ -179,6 +251,20 @@ try {
 ```
 
 A failed Pydantic validation, meaning a bad argument shape rather than a raised `RemoteError`, comes back differently. It reports status 422 with error `"validation"`, plus an `issues` array pointing at the specific field that failed.
+
+## Server-driven redirects
+
+Raising `Redirect` from a remote function sends the client somewhere else instead of returning a result. It's still a `RemoteError` subclass, so it travels the same catch path as `NotFound` or `Unauthorized`, but the router treats it specially: instead of an error envelope, the response comes back as `{"type": "redirect", "location": "..."}`, and the generated client navigates there automatically, rather than throwing.
+
+```python app/remote/redirect_demo.py
+from fymo.remote import remote, Redirect
+
+@remote
+def go_to_login() -> None:
+    raise Redirect("/login")
+```
+
+The default status is 303. Pass a different one with `Redirect(location, status=...)` if a call site needs it. The same `Redirect` class also works when raised from a controller's `getContext()` during server-side rendering, where it produces a real HTTP redirect with a `Location` header instead of a JSON envelope; that side of it belongs on the [app/ directory](/app-directory) page. Here, the point is that a remote function can end a call by sending the client elsewhere, not just by returning data or raising an error.
 
 ## CSRF protection
 

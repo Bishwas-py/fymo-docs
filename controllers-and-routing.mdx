@@ -58,6 +58,36 @@ That same fallback is how a bare slash route resolves to `home.index`, or whatev
 `Router.add_route()` lets an app register a path directly, without going through `resources`, for routes that don't fit the RESTful shape.
 </Note>
 
+## Protecting a route
+
+A route entry can carry `require_auth: true`, or a dotted path to a guard function for a more specific check. Either one requires the dict form of that route entry, with `to:` naming the controller action:
+
+```yaml fymo.yml
+routes:
+  root:
+    to: home.index
+    require_auth: true
+  signin: signin.index
+```
+
+A resource entry works the same way, as a dict with `name:` required:
+
+```yaml fymo.yml
+routes:
+  resources:
+    - posts
+    - name: admin
+      require_auth: app.auth.guards.require_admin
+```
+
+The route named `signin` is the redirect target by convention, and it's always public: `require_auth` on it is stripped at boot, with a warning printed if it's set. Any protected route with no `signin` route registered fails at boot with a `ConfigurationError` naming the fix.
+
+An anonymous request to a protected route gets a `302` to `signin?next=<original path>`, before any SSR work starts. An authenticated request proceeds as normal. When `require_auth` is a dotted path instead of `true`, the signed-in check runs first, then the guard is imported and called with no arguments inside the request scope; any exception it raises redirects the same way as an anonymous visitor.
+
+<Note>
+A convention-alias route (hitting `/home` when only `root` is declared protected) inherits the most restrictive `require_auth` declared anywhere for that controller. An alias can't be used to bypass protection on the routes that share its controller.
+</Note>
+
 ## Route params
 
 A segment like `:id` in a route pattern gets captured by name. Fymo passes it to `getContext()` as a keyword argument, filtered down to whatever the function actually declares in its signature:
@@ -99,7 +129,23 @@ def getDoc():
 
 Neither function is required. A controller with no `getContext()` just renders its template with no props. A controller with no `getDoc()` falls back to the app's configured name as the title.
 
-When auth is enabled, both functions run inside a read-only request scope. This lets `current_user()` resolve the session cookie during server-side rendering itself, not just after the client hydrates. Fymo opens this same scope for both a full page render and a soft nav data fetch. That's what keeps a logged-in user from flashing as logged out during client-side navigation.
+When identity resolvers are registered, both functions run inside a read-only request scope. This lets `current_uid()` resolve the session during server-side rendering itself, not just after the client hydrates. Fymo opens this same scope for both a full page render and a soft nav data fetch. That's what keeps a logged-in user from flashing as logged out during client-side navigation.
+
+## Redirecting from a controller
+
+`getContext()` can raise `Redirect` to send the visitor elsewhere instead of returning props. During a full page render this produces a real `30x` response with a `Location` header, no template gets rendered at all:
+
+```python app/controllers/posts.py
+from fymo.remote import Redirect
+
+def getContext(id: str = ""):
+    post = get_post(id)
+    if post is None:
+        raise Redirect("/posts")
+    return {"post": post}
+```
+
+`Redirect` is the same primitive a remote function raises to redirect the client after an action. From a controller it produces the `30x` response above; from a remote function it produces a `{"type": "redirect", ...}` envelope that the client runtime turns into a navigation. Either call site takes a location and an optional status, defaulting to `303`.
 
 ## Layouts
 
@@ -154,3 +200,29 @@ routes:
 
 If a browser tab was already open before soft nav got disabled, it might still request `/_fymo/data/admin`. Fymo answers with a `409 soft_nav_disabled` error instead of serving data, since that resource always wants a full reload.
 </Accordion>
+
+## The route store
+
+Soft navigation swaps in a new leaf without a full reload, which means a component can't always rely on a fresh mount to know it's on a new page. `$route` gives any component the current route reactively, without passing it down through props:
+
+```svelte
+<script>
+  import { route } from '$route';
+</script>
+
+<p>{$route.pathname}</p>
+```
+
+It resolves to `{ pathname, search, params }`. `params` holds the same route segments a controller's `getContext()` receives, like `:id` from `/posts/:id`. The store is seeded before hydration runs, so its value is correct from first paint, and it updates on every soft nav afterward.
+
+## Head markup with svelte:head
+
+`getDoc()` still owns the data-driven parts of `<head>`, the title and meta tags that change with the page. For markup that's the same on every render of a template, a favicon link or a font preconnect, `svelte:head` inside a component is the simpler tool:
+
+```svelte app/templates/_layout.svelte
+<svelte:head>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+</svelte:head>
+```
+
+The same tag works for things like Google Fonts preconnects in a shared `Nav.svelte`, or any other static tag a component wants to contribute to `<head>` regardless of which controller rendered the page. The rule of thumb: if a controller needs to decide the content, it belongs in `getDoc()`. If it's fixed markup tied to a template, `svelte:head` is more direct.
