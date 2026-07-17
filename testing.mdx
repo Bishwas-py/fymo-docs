@@ -124,7 +124,7 @@ This helper replaced an older markdown-file seeder. Call it after the `blog_app`
   <Card title="_reset_remote_router_globals" icon="rotate">
     Autouse. `FymoApp.__init__` writes directly onto the `fymo.remote.router` module. It sets two flags there, `_explicit_optin` and `_dev_mode`. This fixture resets both back to `False` after every test.
 
-    Without it, a test that builds over `blog_app`, which sets `remote.explicit_optin: true`, could leak that setting into unrelated tests running later in the same process.
+    Without it, a test that builds over `blog_app`, which sets `remote.mode: strict` (resolving to the same internal flag), could leak that setting into unrelated tests running later in the same process.
   </Card>
 </CardGroup>
 

@@ -24,10 +24,10 @@ This is why `fymo build` is a required step before `fymo serve`. And it's why `f
 | `build` | Discovers routes and layouts from `app/templates/`, generates esbuild entry points, shells out to Node for the actual bundling, and writes `dist/manifest.json`. |
 | `core` | The WSGI application (`FymoApp`), request routing and dispatch, the Node sidecar client, middleware (rate limiting, body caps, security headers), and shared SSR controller invocation. |
 | `remote` | The RPC layer: discovers `app/remote/*.py` functions, generates the typed `$remote` client, and dispatches `POST /_fymo/remote/<hash>/<fn>` at runtime. |
-| `auth` | Session cookies, `current_user()`, `@require_auth`, and the password/OAuth/token provider seam. |
+| `auth` | Identity resolvers (`@identify`, auto-discovered from `app/auth/*.py`), `current_uid()`, `@require_auth`, and route-level `require_auth:` enforcement. |
 | `jobs` | Background task registry (`app/jobs/*.py`) and the pluggable `JobProvider` interface (threaded by default, Postgres/Procrastinate for production). |
 | `broadcast` | SSE channel registry (`app/broadcasts/*.py`) and the `/_fymo/broadcast/<module>/<channel>` streaming endpoint. |
-| `storage` | A `StorageProvider` abstraction for files referenced by `media:` routes, built from `fymo.yml`'s `storage:` section. |
+| `storage` | A `StorageProvider` abstraction for files referenced by `storage.expose` routes, built from `fymo.yml`'s `storage:` section. |
 | `cli` | The `fymo` command group: `new`, `init`, `dev`, `build`, `serve`, `jobs-worker`. |
 | `server` | The two ways a built app actually gets served: a threaded dev server and a gunicorn launcher for production. |
 
@@ -69,9 +69,11 @@ The 200-always envelope is deliberate. It keeps the generated `$remote` client's
 
 ## Auth
 
-`auth/context.py` is where request-scoped identity lives. `current_user()` reads and verifies the `fymo_session` cookie. Then it looks the user up through whichever `UserStore` is configured. `@require_auth` wraps a remote function and raises a `RemoteError`, serialized to a 401, when there's no user.
+Fymo owns no user model, only the mechanism. `auth/identity.py` holds the resolver chain: `@identify` registers a function that turns a request into an `Identity(uid)` or `None`, and `current_uid()` walks that chain once per request, caching the result. `auth/discovery.py` auto-imports every module under `app/auth/*.py` so a project's own resolvers self-register, the same glob pattern `remote/discovery.py` uses for `app/remote/*.py`, but a separate one, neither ever scans the other's files.
 
-Login and signup don't return a `Set-Cookie` header directly. Instead they queue one through `queue_session_cookie()`, and `remote/router.py` drains that queue after the call returns. The session-resolver chain, `register_session_resolver`, is the seam other providers, like an OAuth or token-based one, plug into without needing a `fymo_session` cookie at all.
+`auth/context.py` is where `@require_auth` lives: it wraps a remote function and raises `AuthRequired`, a `RemoteError` the router serializes to a 401. `auth/public.py` holds `@public_identity`, the one projection an app registers to decide what crosses to the client as the `$fymo/auth` store. Route-level enforcement (`require_auth:` in `fymo.yml`) is handled separately, in `core/page_auth.py`, since it runs before SSR starts rather than inside a remote-function call.
+
+Login and signup don't return a `Set-Cookie` header directly. They queue one through `fymo.remote`'s `set_cookie`/`clear_cookie`, and the router drains that queue after the call returns. `fymo generate auth` scaffolds a real, editable implementation of all of this into `app/auth/` and `app/remote/auth.py`, it's the fastest way to see the pieces fit together.
 
 ## Jobs and broadcasts
 
@@ -83,9 +85,9 @@ Jobs get submitted by name to a `JobProvider`, threaded by default. Broadcasts a
 
 ## Storage
 
-`storage/registry.py` builds a single `StorageProvider`. It reads that provider's config from the `storage:` section of `fymo.yml`. Unlike auth, jobs, or broadcasts, storage has no default.
+`storage/registry.py` builds a single `StorageProvider`. It reads that provider's config from the `storage:` section of `fymo.yml`. Unlike jobs or broadcasts, storage has no default.
 
-An app with `media:` configured but no `storage:` section fails at build time, and again at startup. That's safer than quietly writing files to local disk in dev, only to lose them once the app runs behind more than one instance in production.
+An app with `storage.expose` entries but no storage provider configured fails at build time, and again at startup. That's safer than quietly writing files to local disk in dev, only to lose them once the app runs behind more than one instance in production.
 
 ## CLI and serving
 
