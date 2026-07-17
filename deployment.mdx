@@ -1,9 +1,9 @@
 ---
 title: Production Deployment
-description: Running a Fymo app in production, from the gunicorn process model to security headers, secrets, and health checks.
+description: Running a Fymo app in production, from choosing a server to security headers, secrets, and health checks.
 ---
 
-Moving a Fymo app from `fymo dev` to production changes a handful of things. This page walks through each one: the process model, what sits in front of it, secrets, worker sizing, health checks, and logging. Read the essentials in each section first, the details are there when you need them.
+Moving a Fymo app from `fymo dev` to production changes a handful of things. This page walks through each one: choosing a server, the process model, what sits in front of it, secrets, worker sizing, health checks, and logging. Read the essentials in each section first, the details are there when you need them.
 
 <Warning>
   The `Dockerfile` at the fymo framework repo root is a template, not something you build directly. Copy it, along with `.dockerignore`, into your Fymo project directory. That's the one containing:
@@ -17,25 +17,66 @@ Moving a Fymo app from `fymo dev` to production changes a handful of things. Thi
   Then run `docker build` from there. The build context is always the current directory, so building from the framework repo instead of your project won't produce a working image.
 </Warning>
 
+## Choosing a server
+
+`fymo serve --prod` runs your app under one of two supported servers. Pick explicitly with `--server`, or let Fymo choose for you:
+
+```sh
+fymo serve --prod                     # auto: granian if installed, else gunicorn
+fymo serve --prod --server granian    # explicit granian, errors if not installed
+fymo serve --prod --server gunicorn   # explicit gunicorn
+```
+
+`auto`, the default, prefers granian when it's importable and falls back to gunicorn when it isn't. The choice is never silent, one log line at startup says which server was picked and why.
+
+<Tip>
+  Asking for `--server granian` without granian installed is a hard error naming the fix, `pip install 'fymo[granian]'`, never a silent fallback to gunicorn.
+</Tip>
+
+granian is an optional extra, not a hard dependency:
+
+```sh
+pip install 'fymo[granian]'
+```
+
+<Accordion title="Why prefer granian">
+  gunicorn's `sync` worker class handles exactly one request at a time per process, which makes the server layer, not Fymo, the bottleneck. Measured layer by layer on the same machine with `ab -n 2000 -c 50`, interleaved runs:
+
+  | Workload | gunicorn (sync) | granian (WSGI) |
+  | --- | --- | --- |
+  | Bare do-nothing WSGI app, 1 worker | 2,961 req/s | 27,022 req/s |
+  | Fymo full SSR | ~1,400–2,259 req/s | ~4,300 req/s |
+
+  Fymo's own per-request time is 0.3–0.5 ms. On gunicorn's sync workers, the server layer throws most of that away. An independent re-run on different hardware reproduced the shape: per worker, granian carried roughly 2.3x gunicorn's SSR throughput on the same app, with zero failed requests on either server.
+
+  `/healthz`, JSON access logging, and clean sidecar shutdown behave identically under both servers, only raw throughput differs.
+</Accordion>
+
+gunicorn is still the right pick when you want the battle-tested option, already have gunicorn-specific tooling around your deploy, or can't take on a compiled-wheel dependency.
+
 ## Process model
 
-`fymo serve --prod --workers N` runs your app under gunicorn. Each worker is a full Python process, and each one spawns its own Node child to handle SSR. Nothing is shared between workers, a fresh sidecar starts after every fork, so a running instance looks like this:
+`fymo serve --prod --workers N` runs N worker processes under whichever server you picked. Under both servers, each worker is a full Python process that spawns its own Node child to handle SSR. Nothing is shared between workers, so a running instance looks like this:
 
 ```
-gunicorn arbiter
+server master (gunicorn arbiter / granian main)
 ├── worker 1 (python) --spawns--> node dist/sidecar.mjs (SSR child)
 ├── worker 2 (python) --spawns--> node dist/sidecar.mjs (SSR child)
 └── worker N (python) --spawns--> node dist/sidecar.mjs (SSR child)
 ```
 
+<Accordion title="How workers get their sidecars">
+  How workers come to own their sidecars differs by server. gunicorn forks workers from a master that already imported the app, so Fymo rebuilds a worker-owned app after each fork. granian workers each import `server.py` themselves and never share anything with the parent. The resulting process tree, and everything below it, is the same either way.
+</Accordion>
+
 That's why your runtime container needs both Python and Node. A Python-only image will boot fine and even pass a basic smoke check. Every real page render will fail once traffic arrives, though, since there's no sidecar around to render with.
 
 ## Reverse proxy and TLS
 
-Put a reverse proxy in front of gunicorn and let it terminate TLS. Don't terminate TLS in gunicorn itself, it isn't built for that job.
+Put a reverse proxy in front of your production server, granian or gunicorn, and let it terminate TLS. Don't terminate TLS in the app server itself.
 
 <Tip>
-  Fymo configures gunicorn's `sync` worker class, which is another reason a proxy belongs in front: it handles slow client connections and TLS negotiation so your Python workers don't have to.
+  Under gunicorn, Fymo configures the `sync` worker class, which handles exactly one request at a time per worker, another reason a proxy belongs in front: it handles slow client connections and TLS negotiation so your Python workers don't have to.
 </Tip>
 
 Caddy handles this well out of the box, issuing and renewing certificates automatically, and it sets `X-Forwarded-Proto` and `X-Forwarded-For` for you:
@@ -157,18 +198,13 @@ A few rules follow naturally from what this key protects:
 
 ## Config variables
 
-`fymo.yml` can read environment variables directly, so a deployment-specific value like an auth issuer URL doesn't force you to write a custom Python class just to read `os.environ`:
+`fymo.yml` can read environment variables directly, so a deployment-specific value like a database DSN doesn't force you to write a custom Python class just to read `os.environ`:
 
 ```yaml
-auth:
-  providers:
-    - type: oidc
-      id: auth0
-      authorize_endpoint: ${AUTH0_AUTHORIZE_ENDPOINT}
-      token_endpoint: ${AUTH0_TOKEN_ENDPOINT}
-      userinfo_endpoint: ${AUTH0_USERINFO_ENDPOINT}
-      client_id_env: AUTH0_CLIENT_ID
-      client_secret_env: AUTH0_CLIENT_SECRET
+jobs:
+  provider:
+    type: procrastinate
+    dsn: ${DATABASE_URL}
 ```
 
 `${VAR}` resolves to the variable's value, and fails loudly at config load if it's unset. `${VAR:-default}` falls back to a default instead.
@@ -180,34 +216,58 @@ auth:
   - Interpolation runs on the raw YAML text before parsing, so it works anywhere in the file, even inside comments. A substitution written in a `#` comment still gets resolved, since the substitution pass doesn't know about comments.
 </Accordion>
 
-<Accordion title="Conditional auth providers">
-  A provider entry can carry `required: auto` to make its inclusion depend on whether it's actually configured:
+<Accordion title=".env for local development">
+  In dev mode, Fymo loads a `.env` file from the project root into the process environment before `fymo.yml` is parsed, so `${VAR}` placeholders and any code reading `os.environ` can see it:
 
-  ```yaml
-  auth:
-    providers:
-      - type: clerk
-        required: auto
+  ```
+  CLERK_ISSUER=https://example.clerk.accounts.dev
+  DATABASE_URL=postgres://localhost/myapp_dev
   ```
 
-  With this set, Fymo checks the provider's own `is_configured()` method before constructing it. If that returns false, the provider is skipped entirely, no error, no instance, nothing added to the app.
+  One `KEY=value` per line. Blank lines and lines starting with `#` are ignored, and a value wrapped in matching quotes has them stripped. A real environment variable already set in the shell always wins, `.env` never overwrites it.
 
-  That lets a provider stay dormant in local dev when its env vars aren't set. It switches on automatically once real values land, with no separate conditional wiring needed in your app code. Any value for `required` other than the literal string `"auto"` raises a clear config error naming the bad value.
-
-  `ClerkProvider` implements this out of the box. It checks for `CLERK_ISSUER` first, falling back to the Frontend API domain encoded in `PUBLIC_CLERK_PUBLISHABLE_KEY`, and derives its JWKS URL automatically. Neither variable needs a wrapper class. Every existing provider is unaffected, since only an entry that both sets `required: auto` and points at a provider supporting it gets this behavior.
+  This file is never read in production. `.env` only loads when `dev=True`, so a production process ignores it even if one exists on disk. Add `.env` to `.gitignore` yourself, Fymo doesn't do that for you.
 </Accordion>
+
+## Provider-owned tables
+
+Some Fymo providers create real, permanent objects in your app's database. `jobs: {provider: procrastinate}` puts its queue tables, functions, and types, `procrastinate_jobs`, `procrastinate_events`, and others, in the same schema as your own tables.
+
+Your declarative schema file only declares what your app owns, so a schema diff tool like pgschema or migra sees the provider's objects as strays and generates `DROP TABLE`, `DROP FUNCTION`, and `DROP TYPE` for every one of them. Applying that plan destroys the live job queue.
+
+<Warning>
+  Before running any schema diff against a database Fymo providers share, enumerate what they own. Applying a diff plan without excluding provider objects will drop your job queue.
+</Warning>
+
+```sh
+fymo schema provider-tables          # one "kind name" per line
+fymo schema provider-tables --json   # [{kind, name, provider}, ...] for tooling
+```
+
+<Accordion title="How the list is built">
+  The command reads `fymo.yml`, resolves the configured `jobs:` and `broadcasts:` providers, and prints every table, type, function, sequence, index, trigger, and extension they create. The list is derived from the installed provider library itself, so it matches the version you actually run, and no database connection is made.
+
+  Feed the names into your tool's exclude or ignore list, or generate the list in CI, instead of hand-maintaining one.
+</Accordion>
+
+Providers that create nothing print nothing. The default `threaded` job provider and the `postgres` broadcast provider, pure LISTEN/NOTIFY, both own zero objects, and the command exits 0 with a note on stderr.
 
 ## Worker sizing
 
-Each gunicorn worker costs one Python process plus one Node sidecar. Sizing purely on CPU cores, the usual `2 * cores + 1` rule of thumb, will overcommit memory here. Budget with both processes in mind:
+`--workers` means OS processes under both servers, and each worker costs one Python process plus one Node sidecar. Budget with both in mind:
 
 ```
 total memory ≈ workers × (python_worker_rss + node_sidecar_rss)
 ```
 
 <Tip>
-  Measure both processes' memory under load before picking a worker count. Component tree size and SSR payload size both affect the Node side. Start conservative, `--workers 2` to `4` on a single host, and scale with observed memory rather than CPU alone.
+  Measure both processes' memory under load before picking a worker count. Component tree size and SSR payload size both affect the Node side.
 </Tip>
+
+How far throughput scales with each added worker differs by server:
+
+- **gunicorn** (`sync` worker class): one request at a time per worker, so concurrency comes only from process count. The usual rule of thumb is 2 to 4 workers per core, but each one carries a sidecar, so sizing purely on CPU count overcommits memory here. Start conservative, `--workers 2` to `4` on a single host, and scale with observed memory, not just CPU.
+- **granian**: each worker dispatches requests from a pool of blocking threads, Fymo caps it at `min(2 × cores, 64)` per worker, so a single worker already handles concurrent requests. Fewer processes reach the same throughput. Start at `--workers 1` to `2` and add more only when a single worker's CPU, Python side or its Node sidecar, saturates.
 
 `--workers` is a CLI flag, so you can tune it per environment without rebuilding the image:
 
@@ -262,21 +322,26 @@ Fymo owns a single handler on Python's root logger, so your app's own `logging.g
   The underlying `procrastinate` library normally echoes job arguments in its own log lines, so its logger is capped to `WARNING` by default and its permanent-failure line is filtered out. Fymo's own "job failed" line carries name, status, duration, and the traceback instead. Set the `procrastinate` logger to `INFO` explicitly only if you're fine with its lines including job arguments.
 </Accordion>
 
-## Media routes
+## Storage and exposure
 
-If your app needs to serve binary files with range support, think video or audio scrubbing, you don't need to hand-write a raw route for it. Declare it in `fymo.yml` instead:
+Where a file lives follows one rule. Something that ships with your code, a logo, a font, a favicon, belongs in `app/static/`. Something created at runtime, an upload, a recording, anything a job writes, belongs under `storage:`. Give a runtime file a URL by adding it to `storage.expose`.
+
+Apps that need to serve binary files with range support, video or audio scrubbing in particular, don't need to hand-write a raw route for it. Declare the exposure in `fymo.yml` instead:
 
 ```yaml
-media:
-  - prefix: /media/videos/
-    dir: data/videos
-    extensions: [webm]
+storage:
+  provider: local
+  root: ${DATA_DIR:-data}
+  expose:
+    - prefix: /media/videos/
+      dir: videos
+      extensions: [webm]
 ```
 
-Fymo handles range requests, content types, and 404s for you. This section is entirely optional, an app without one registers no extra routes at all.
+Fymo handles range requests, content types, and 404s for you. `expose:` is entirely optional, an app without one registers no extra routes at all.
 
 <Accordion title="How matching and range requests work">
-  `prefix` matches the request path the same way Fymo's own routes do. Think `/dist/` or `/assets/`, it's a plain prefix, not a template. `dir` is resolved relative to your project root.
+  `prefix` matches the request path the same way Fymo's own `/dist/` and `/static/` routes do, a plain prefix, not a template. `dir` resolves relative to `storage.root` (the project root when unset), so the entry above serves files a job wrote via `get_storage_provider().write("videos/...", data)`.
 
   `extensions` is the allow-list for the filename after the prefix. Anything else gets a 400, along with any filename containing `..` or starting with `/`.
 
@@ -287,7 +352,15 @@ Fymo handles range requests, content types, and 404s for you. This section is en
   - A missing file gets a 404.
   - The content type is resolved from the filename via the standard library's `mimetypes` module.
 
-  You can list multiple `media` entries with different prefixes, directories, and extensions.
-
-  For anything that isn't just "serve a file from a directory", webhooks or non-file responses, the raw WSGI extension point at `app/routes.py` still sits alongside this.
+  You can list multiple `expose` entries with different prefixes, directories, and extensions.
 </Accordion>
+
+<Warning>
+  `storage.expose` needs `storage.provider` set. Exposed entries serve files through the configured storage provider, and there's no default, so an `expose` list with no provider configured fails at build and at boot.
+</Warning>
+
+<Note>
+  An `expose` `dir` that doesn't exist yet under the storage root only warns at boot, naming the resolved path. A job may create it later.
+</Note>
+
+For anything that isn't just "serve a file from a directory", webhooks or non-file responses, the raw WSGI extension point at `app/routes.py` still sits alongside this.

@@ -5,22 +5,21 @@ description: Every key fymo.yml supports, its type, its default, and how ${VAR} 
 
 `fymo.yml` lives at your project root and loads once, at startup. The class that handles it, `ConfigManager`, lives in `fymo/core/config.py`.
 
-The file itself is optional. Every section below has a sensible default, so a project with no fymo.yml at all still boots. It just runs with auth off and jobs on the in-process threaded provider.
+The file itself is optional. Every section below has a sensible default, so a project with no fymo.yml at all still boots. It just runs with implicit remote exposure (hygiene-checked at build time) and jobs on the in-process threaded provider.
 
-Each section loads through its own getter, like `get_auth_config()` or `get_jobs_config()`. An explicitly null section, `auth:` with nothing underneath, behaves the same as a missing one. Both resolve to `{}`.
+Each section loads through its own getter, like `get_remote_config()` or `get_jobs_config()`. An explicitly null section, `jobs:` with nothing underneath, behaves the same as a missing one. Both resolve to `{}`.
 
 ## Env var interpolation
 
-`${VAR}` and `${VAR:-default}` placeholders get resolved directly in the raw YAML text. This happens before `yaml.safe_load` ever parses it, and it happens once for the whole file, not per section. So a placeholder works the same whether it sits at the top level or three levels deep inside `auth.providers`.
+`${VAR}` and `${VAR:-default}` placeholders get resolved directly in the raw YAML text. This happens before `yaml.safe_load` ever parses it, and it happens once for the whole file, not per section. So a placeholder works the same whether it sits at the top level or three levels deep inside `jobs.provider.env_var`.
 
 ```yaml
 name: ${APP_NAME}
 description: ${APP_DESC:-a fymo app}
 
-auth:
-  providers:
-    - type: oidc
-      issuer: ${OIDC_ISSUER}
+storage:
+  provider: local
+  root: ${UPLOAD_ROOT:-data/uploads}
 ```
 
 - `${VAR}` is required. If `VAR` isn't set, config loading raises `ConfigurationError` naming the variable. It never silently falls back to loading the literal string `${VAR}`.
@@ -39,15 +38,14 @@ Every resolved value gets spliced back into the YAML text as an explicit double-
 
 ## Typed values from strings
 
-Every interpolated value is a plain YAML string. `${VAR}` never becomes a real bool or int just because the variable holds text like "true" or "60". That matters most for booleans: a bare `bool("false")` in Python evaluates to `True`, since any non-empty string is truthy. A config value like `auth.enabled: ${AUTH_ENABLED}` resolving to the string "false" would otherwise silently turn auth on.
+Every interpolated value is a plain YAML string. `${VAR}` never becomes a real bool or int just because the variable holds text like "true" or "60". That matters most for booleans: a bare `bool("false")` in Python evaluates to `True`, since any non-empty string is truthy. A config value like `limits.rate_limit.enabled: ${RATE_LIMIT_ENABLED}` resolving to the string "false" would otherwise silently turn rate limiting back on.
 
 Fymo prevents this with `parse_bool()`, used for every boolean key in fymo.yml:
 
-- `auth.enabled`
-- `remote.explicit_optin`
 - `security.headers.enabled`
 - `limits.rate_limit.enabled`
 - `limits.rate_limit.trust_proxy`
+- `remote.explicit_optin` / `remote.allow_implicit` (deprecated, still parsed for one deprecation cycle, see [remote](#remote))
 
 | Input | Result |
 |---|---|
@@ -140,38 +138,18 @@ In production (`dev=False`), two more apply on top. Both are skipped entirely in
 
 A header already present in the response from your own handler is never overwritten by these defaults.
 
-## auth
+## Removed keys
 
-```yaml
-auth:
-  enabled: true
-  user_store: fymo.auth.store.SqliteUserStore
-  email_sender: fymo.auth.email.LoggingEmailSender
-  providers:
-    - password
-```
+Two sections that used to live in `fymo.yml` are gone. Both fail loudly at boot, naming the exact fix, not just a deprecation warning.
 
-| Key | Type | Default |
-|---|---|---|
-| `enabled` | bool | `false` |
-| `user_store` | dotted class path | `fymo.auth.store.SqliteUserStore` |
-| `email_sender` | dotted class path | `fymo.auth.email.LoggingEmailSender` |
-| `providers` | list of provider entries | `[password]` |
+| Removed key | Where it went |
+|---|---|
+| `auth:` | Identity now lives in code, not config. Run `fymo generate auth` (password, or `--clerk` / `--skeleton`) to scaffold `app/auth/`. See [Authentication](/auth). |
+| `media:` (top-level) | Folded into `storage.expose`, see [storage](#storage) below. |
 
-A provider entry can be a bare built-in name:
-
-- `password`
-- `google`
-- `oidc`
-- `clerk`
-
-Or it can be an object: a `type` key for a built-in provider, or a `class` key for a dotted path to your own. Either way, it can carry whatever extra options that provider's constructor takes.
-
-Add `required: auto` to an entry to skip it entirely when the provider isn't configured, instead of crashing on a missing secret.
-
-<Card title="Authentication" icon="user-lock" href="/auth">
-Full provider config, the session cookie format, and how to write a custom UserStore or AuthProvider.
-</Card>
+<Warning>
+A leftover `auth:` block raises: "the `auth:` block was removed, identity now lives in code. Run `fymo generate auth`...". A leftover top-level `media:` raises: "top-level `media:` was removed, exposure now lives under `storage.expose`...". Both are `ConfigurationError`s at load time, before the app boots. Full migration notes: [Upgrading](/upgrading).
+</Warning>
 
 ## jobs
 
@@ -212,14 +190,29 @@ Same string-or-object shape as `jobs.provider`. `postgres` is currently the only
 
 ```yaml
 remote:
-  explicit_optin: true
+  mode: strict
 ```
 
 | Key | Type | Default |
 |---|---|---|
-| `explicit_optin` | bool | `false` |
+| `mode` | `strict` \| `implicit-legacy` | none, see the default behavior below |
 
-With `explicit_optin` off (the default), every public, type-annotated top-level function in `app/remote/*.py` is exposed to the browser. Turning it on requires `@remote` on each function you want reachable. Everything else in that file stays server-only.
+`remote.mode` controls whether an `app/remote/*.py` function needs `@remote` to be callable from the browser.
+
+- `strict`: only `@remote`-decorated functions dispatch. Everything else in the module stays server-only.
+- `implicit-legacy`: every public, type-annotated top-level function dispatches, decorated or not. Named "legacy" on purpose, an escape hatch for apps not yet ready to mark every endpoint, not a mode to reach for by default.
+
+With no `remote:` key at all, functions are exposed implicitly, the same reach as `implicit-legacy`, but the build still runs its hygiene check against unmarked functions and fails if it finds one that would ship implicitly. That check is what nudges a growing app toward `strict` before something unintended goes live. Setting `mode` to either `strict` or `implicit-legacy` explicitly silences the hygiene check, since there's nothing left for it to warn about.
+
+`fymo new` scaffolds fresh apps with `remote: {mode: strict}` set explicitly, secure by default for a greenfield project. Older apps that never set `remote:` keep running implicit-with-hygiene until they opt into a mode.
+
+<Note>
+The old `explicit_optin`/`allow_implicit` booleans are deprecated but still accepted for one deprecation cycle. Setting `mode` alongside either one is a hard `ConfigurationError`, since the two ways of saying the same thing could disagree. Move to `mode: strict` or `mode: implicit-legacy` instead of the old booleans; don't reach for `explicit_optin` in new config.
+</Note>
+
+<Card title="Remote Functions" icon="bolt" href="/remote-functions">
+Discovery rules, the generated client, the wire format, and error handling.
+</Card>
 
 ## storage
 
@@ -237,30 +230,52 @@ storage:
 |---|---|---|
 | `provider` (bare string form), or `provider`/`class` (object form) | string / dotted path | none, required if used |
 
-Unlike jobs, broadcasts, and auth, there is no fallback provider here. Leaving `storage:` out of fymo.yml fails at startup if `media:` is configured. Silently writing to local disk is exactly the kind of default that works fine in dev, but quietly loses data in production.
+Unlike jobs and broadcasts, there is no fallback provider here. Silently writing to local disk is exactly the kind of default that works fine in dev, but quietly loses data in production, so Fymo makes you spell it out.
 
 <Card title="Storage and Media" icon="folder-open" href="/storage-and-media">
 The StorageProvider interface, byte-range reads, and writing a custom provider.
 </Card>
 
-## media
+### storage.expose
 
 ```yaml
-media:
-  - prefix: /media/videos/
-    dir: data/videos
-    extensions: [webm]
+storage:
+  provider: local
+  root: data
+  expose:
+    - prefix: /media/videos/
+      dir: videos
+      extensions: [webm]
 ```
 
-| Key | Meaning | Required |
-|---|---|---|
-| `prefix` | URL path prefix requests are matched under. | yes |
-| `dir` | Storage-key namespace files are resolved from, through the configured `storage:` provider. | yes |
-| `extensions` | Allowed extensions, lowercase, no leading dot. Anything else gets a `400`. | no, defaults to none allowed |
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `prefix` | string | yes | URL path prefix requests are matched under. |
+| `dir` | string | yes | Storage-key namespace files resolve from, through the configured `storage` provider. Not a filesystem path. |
+| `extensions` | list of string | no, defaults to none allowed | Allowed extensions, lowercase, no leading dot. Anything else, or a traversal attempt, gets a `400`, the same signal, so a probing request can't tell the two apart. |
 
-`media:` is a list, defaults to `[]`. Each entry becomes a byte-range-aware `GET` route, useful for video and audio scrubbing, with no hand-written WSGI handler needed.
+`storage.expose` is a list nested under `storage:`, defaults to `[]`. Each entry becomes a byte-range-aware `GET` route:
 
-A prefix under the reserved `/dist/` or `/assets/` paths doesn't fail the build, it only prints a warning. Those routes are matched first, so a prefix there would never actually get reached.
+| Request | Response |
+|---|---|
+| Plain request | 200 |
+| With a `Range` header | 206, with `Content-Range` |
+| Unsatisfiable range | 416 |
+| Bad extension or traversal attempt | 400 (same signal for both, so a probing request can't tell them apart) |
+| Missing file | 404 |
+
+Configuring `expose` entries without also setting `storage.provider` (or `class`) is a hard error, at both boot and `fymo build`:
+
+```
+storage.expose is configured but storage itself is not: exposed entries
+serve files through the configured StorageProvider and there is no
+default, so storage must be configured. Set storage.provider
+(e.g. `storage: {provider: local, root: data}`).
+```
+
+<Warning>
+`/dist/` and `/static/` are reserved. `FymoApp`'s own dispatch matches them before an exposed route gets a turn, so an `expose` prefix landing under either only prints a startup warning, it doesn't fail the build (the route would just never be reached). An entry whose `dir` doesn't exist yet under the storage root also only warns, since a job may create it later.
+</Warning>
 
 ## logging
 
@@ -287,17 +302,17 @@ What flows through fymo's single root-logger handler, and the shape of request a
 
 ## The identity secret
 
-`FYMO_SECRET` isn't a `fymo.yml` key, it's read straight from the environment. But it governs enough of the config above, like signed session cookies and OAuth's PKCE state, that it deserves a mention here.
+`FYMO_SECRET` isn't a `fymo.yml` key, it's read straight from the environment. But it governs enough of what's built on top of `fymo.yml`, like the signed session tokens app-owned auth code mints through `fymo.auth`'s `sign_token`/`verify_token`, and the anonymous `fymo_uid` cookie every remote function call carries, that it deserves a mention here.
 
 Resolution order at startup:
 
 1. `FYMO_SECRET` env var, used as raw UTF-8 bytes. Must be at least 16 characters, or startup raises.
 2. `.fymo/secret.key` on disk, if present and at least 16 bytes.
 3. Dev mode only (`dev=True` or `FYMO_DEV=1`). 32 random bytes get generated and written to `.fymo/secret.key` (mode `0600`) for reuse across restarts.
-4. Production with neither set: startup raises. A forgeable session cookie is a worse failure mode than refusing to boot.
+4. Production with neither set: startup raises. A forgeable session token is a worse failure mode than refusing to boot.
 
 <Accordion title="Why the dev flags skip parse_bool">
-`FYMO_DEV` and FYMO_SECRET are read with a simple truthy check, not with `parse_bool`: "1", "true", "yes", or "on", case-insensitive.
+`FYMO_DEV` and `FYMO_SECRET` are read with a simple truthy check, not with `parse_bool`: "1", "true", "yes", or "on", case-insensitive.
 
 That's deliberate. Defaulting an unrecognized value to `False` here is a reasonable fallback for an env var read directly. The stricter `parse_bool` governs actual fymo.yml booleans instead, where a typo should raise rather than get guessed at.
 </Accordion>
@@ -311,14 +326,14 @@ fymo dev --host 0.0.0.0 --port 8000
 fymo serve --host 0.0.0.0 --port 8000 --prod --workers 4
 ```
 
-If you see those sections in an older or generated fymo.yml, they're inert: safe to leave, safe to delete.
+If you see those sections in an older or generated fymo.yml, they're inert: safe to leave, safe to delete. This is different from `auth:` and `media:` above, which aren't merely unread, they're hard boot errors.
 
 ## Full example
 
 ```yaml
 name: acme-blog
 version: 1.0.0
-description: "Blog with auth, background email, and video uploads"
+description: "Blog with background jobs and video uploads"
 
 routes:
   root: index.index
@@ -326,21 +341,8 @@ routes:
     - posts
     - tags
 
-auth:
-  enabled: true
-  providers:
-    - password
-    - type: oidc
-      id: okta
-      authorize_endpoint: ${OKTA_AUTHORIZE_ENDPOINT}
-      token_endpoint: ${OKTA_TOKEN_ENDPOINT}
-      userinfo_endpoint: ${OKTA_USERINFO_ENDPOINT}
-      client_id_env: OKTA_CLIENT_ID
-      client_secret_env: OKTA_CLIENT_SECRET
-      required: auto
-
 remote:
-  explicit_optin: true
+  mode: strict
 
 jobs:
   provider: procrastinate
@@ -351,11 +353,10 @@ broadcasts:
 storage:
   provider: local
   root: data/uploads
-
-media:
-  - prefix: /media/videos/
-    dir: videos
-    extensions: [webm, mp4]
+  expose:
+    - prefix: /media/videos/
+      dir: videos
+      extensions: [webm, mp4]
 
 limits:
   rate_limit:
@@ -367,3 +368,4 @@ logging:
   destination: ${LOG_DESTINATION:-terminal}
   level: ${LOG_LEVEL:-info}
 ```
+</content>
