@@ -8,13 +8,16 @@ Every Fymo app is shaped the same way. Once you know this map, you know your way
 | Directory | Language | Purpose |
 |---|---|---|
 | `app/controllers` | Python | Page controllers, one module per route, exposing `getContext()`/`getDoc()` to the matching template. |
-| `app/templates` | Svelte / TS | The page components the router renders, one file per route (plus `_layout.svelte` files and `_global.css`). |
+| `app/templates` | Svelte / TS | The page components the router renders, one file per route (plus `_layout.svelte` files). |
 | `app/components` | Svelte / TS | Reusable UI components shared across templates. |
+| `app/assets` | Svelte / TS / CSS | Build inputs: stylesheets, fonts, images. Compiled and content-hashed into `dist/` by esbuild, imported explicitly from a layout, never served raw. |
 | `app/remote` | Python | Functions the browser can call directly through the generated `$remote` client. Public, type-annotated functions are exposed automatically. Add `@remote` to require opting in explicitly. |
+| `app/auth` | Python | Where `@identify` resolvers live, deciding who's signed in. Auto-discovered the same way as `app/remote`, but as a separate glob. |
 | `app/jobs` | Python | Background task registry, submitted through a `JobProvider`. Every top-level function becomes a submittable task automatically. Mark entry points with `@task` to make that explicit. |
 | `app/broadcasts` | Python | SSE channel definitions, discovered the same way as `app/jobs`. |
 | `app/lib` | TypeScript / Svelte | The `$lib/*` alias target (see `tsconfig.json`). TypeScript-only, since nothing here ever runs on the server. |
 | `app/support` | Python | Shared server-side utilities that don't fit anywhere else: a database connection helper, auth env config, media path helpers, and similar cross-cutting code used by controllers, remote functions, and jobs. |
+| `app/static` | any | Files served verbatim at `/static/<path>`, unchanged by the build. |
 
 ## Task registries
 
@@ -39,3 +42,28 @@ Without this check, Python would simply never import a stray `.svelte` file, and
 <Tip>
 A `.py` file under `app/lib` gets the gentle version of this: not a blocked build, just a friendly suggestion in the terminal that it probably belongs in `app/support` instead. `app/lib` is the `$lib/*` alias for TypeScript and Svelte imports, so Python placed there never runs. Fymo is just looking out for you.
 </Tip>
+
+Stylesheets get the same treatment. They're build inputs, not something you drop into a template folder: they live in `app/assets`, imported explicitly from a layout, like `import '../assets/app.css'` in `app/templates/_layout.svelte`. A loose `.css` file anywhere under `app/templates` fails the build with `stylesheets live in app/assets/, found <path>`. `<style>` blocks inside a `.svelte` file are untouched, that's Svelte's own component styling and none of this check's business.
+
+<Note>
+Coming from an older Fymo project, `app/templates/_global.css` used to be picked up automatically. It isn't anymore. A project still shipping that exact file fails the build with the exact fix:
+
+```
+Error: _global.css is no longer auto-injected. Move it to app/assets/app.css
+and add `import '../assets/app.css'` to app/templates/_layout.svelte.
+```
+</Note>
+
+For the full pipeline, fonts, and how nested layouts compose their CSS, see [Assets, fonts, and static files](/assets-fonts-and-static-files). This page is just the map, that one's the walkthrough.
+
+## Where identity lives
+
+`app/auth` is where `@identify` resolvers decide who's making a request. Fymo auto-discovers every module there the same way it discovers `app/remote`, just through a separate glob, one is never mistaken for the other.
+
+Run `fymo generate auth` to scaffold a resolver and the login flow around it. Delete the whole directory and identity resolution turns off, nothing else needs to change.
+
+That's the placement story. For resolvers, `current_uid()`, route guards, and testing with `signed_in()`, see [Authentication](/auth).
+
+## One line, three homes
+
+If a file's home is ever unclear, one line covers most of it. In git and compiled with the app, it belongs in `app/assets`. In git and served exactly as it sits on disk, it belongs in `app/static`. Created after the app is deployed, it belongs in storage, not in git at all. See [Storage and media](/storage-and-media) for that last one.

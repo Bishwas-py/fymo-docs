@@ -1,0 +1,141 @@
+---
+title: Assets, Fonts, and Static Files
+description: How CSS, fonts, and images compile into your app, and how to serve files verbatim from app/static.
+---
+
+Every Fymo app splits files two ways: things the build compiles, and things it copies untouched. `app/assets/` is the first, `app/static/` is the second. Mixing them up is the easiest way to end up serving a raw font file at the wrong URL, or shipping CSS that never made it into a page.
+
+<Tip>
+If you've used Rails, this maps directly onto `app/assets` and `public`: one is compiler input, the other is copied verbatim. Fymo just calls the second one `app/static`.
+</Tip>
+
+## Build inputs
+
+`app/assets/` holds stylesheets, fonts, and images, the raw material esbuild compiles and content-hashes into `dist/` at build time. Nothing in this directory is served raw, and nothing here is a page template either. It's compiler input, full stop.
+
+A freshly scaffolded app ships one file here, `app/assets/app.css`, imported explicitly rather than picked up by convention:
+
+```css app/assets/app.css
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+```
+
+## Importing CSS from a layout
+
+A layout pulls in its stylesheet the same way any Svelte component imports anything, a plain `import` in its `<script>` block:
+
+```svelte app/templates/_layout.svelte
+<script>
+  import '../assets/app.css';
+
+  let { children } = $props();
+</script>
+```
+
+esbuild bundles that CSS into the layout's own entry, and a page links whatever its layout chain pulls in, root first, then anything a nested layout adds. A resource's own `_layout.svelte` only needs to import what it adds beyond the root, since the root layout's CSS already reaches every page under it.
+
+Because a route's own bundle also reaches its layout component (that's how hydration finds it), the same CSS can end up in both the layout's stylesheet and the route's. That's harmless: CSS rules are idempotent and both files are cached immutably, so nothing renders wrong and there's nothing to fix.
+
+## _global.css is gone
+
+Older Fymo projects had a magic filename, `app/templates/_global.css`, picked up automatically and linked into every page. That auto-injection is deleted, not deprecated. A project still shipping the file fails the build with the exact fix:
+
+```
+Error: _global.css is no longer auto-injected. Move it to app/assets/app.css
+and add `import '../assets/app.css'` to app/templates/_layout.svelte.
+```
+
+Any other loose `.css` file under `app/templates/`, at any depth, fails the same way, just with a more general message:
+
+```
+stylesheets live in app/assets/, found app/templates/home/loose.css
+```
+
+`<style>` blocks inside a `.svelte` file aren't affected. That's Svelte's own component styling, and this check has no opinion about it.
+
+## Fonts
+
+A font file lives next to the CSS that references it, resolved through esbuild's file loader: content-hashed, and rewritten to resolve under `/dist/client/`.
+
+```css app/assets/app.css
+@font-face {
+  font-family: 'Inter';
+  src: url('./fonts/inter.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+```
+
+A package-based font works too. `@import '@fontsource/inter'` resolves through the project's own `node_modules`, the same way any other npm import would:
+
+```css app/assets/app.css
+@import '@fontsource/inter';
+```
+
+<Note>
+A root-absolute URL inside CSS, something like `url('/static/logo.png')`, is left alone rather than bundled. Fymo treats it as a reference to a verbatim static file, not a build input, so esbuild passes it through untouched.
+</Note>
+
+## Verbatim files
+
+`app/static/` is the other half: files committed to git and served byte-for-byte at `/static/<path>`, unchanged by the build. A favicon, a PDF, a manifest, anything that should reach the browser exactly as it sits on disk.
+
+<Warning>
+The old `/assets/` URL prefix is gone. It doesn't redirect and it doesn't dual-serve alongside `/static/`, it simply stops existing: a request to the old prefix falls through to routing and hits a normal 404. Grep your app for `/assets/` if you're migrating an older project.
+</Warning>
+
+Every response from `/static/` carries an `ETag` built from the file's modification time and size, plus a one-hour `Cache-Control`. Send that ETag back as `If-None-Match` and a matching file returns a real `304`, body omitted:
+
+```
+GET /static/favicon.svg
+If-None-Match: "18c320970e082a3c-dc"
+
+304 NOT MODIFIED
+```
+
+Path resolution is traversal-guarded the same way storage keys are: no `..` segment, no absolute-path override, and a final containment check that also catches anything a symlink might try to escape through.
+
+## The root allowlist
+
+A handful of filenames are conventionally expected at the bare domain root, not under any prefix, a browser asking for `/favicon.ico`, a crawler asking for `/robots.txt`. Fymo resolves these from `app/static/` too, just at a different URL than everything else in that directory:
+
+- `favicon.ico`
+- `favicon.svg`
+- `robots.txt`
+- `apple-touch-icon.png`
+- `apple-touch-icon-precomposed.png`
+- `site.webmanifest`
+- `browserconfig.xml`
+
+The `.well-known/` prefix is allowlisted the same way, for things like ACME challenges or `security.txt`. Put a file at `app/static/robots.txt` and it's served at `/robots.txt`, not `/static/robots.txt`.
+
+<Note>
+The allowlist only knows where to look, it doesn't invent content. If `app/static/robots.txt` doesn't exist, `/robots.txt` 404s exactly like any other missing route, not a 500 and not a fallback page.
+</Note>
+
+## Favicon and svelte:head
+
+A freshly scaffolded layout wires its favicon through `svelte:head`, not through `getDoc()`:
+
+```svelte app/templates/_layout.svelte
+<svelte:head>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+</svelte:head>
+```
+
+That's the general pattern for markup that's the same on every page: a favicon link, a font preconnect, anything a controller doesn't need to decide per request. See [Controllers and routing](/controllers-and-routing) for how `svelte:head` and `getDoc()` divide that work between them.
+
+<CardGroup cols={2}>
+  <Card title="The app/ directory" icon="folder-tree" href="/app-directory">
+    Where assets and static files fit among the rest of a Fymo project.
+  </Card>
+  <Card title="Storage and media" icon="database" href="/storage-and-media">
+    Files written at runtime, and serving them with byte-range support.
+  </Card>
+</CardGroup>

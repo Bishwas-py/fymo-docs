@@ -1,19 +1,19 @@
 ---
 title: Storage and Media
-description: The StorageProvider abstraction for where files live, and declarative media routes for serving them with byte-range support.
+description: The StorageProvider abstraction for where files live, and storage.expose for serving them over HTTP with byte-range support.
 ---
 
 ```yaml fymo.yml
 storage:
   provider: local
-  root: data/uploads
+  root: data
 ```
 
-Anywhere Fymo needs to put or get a blob of bytes, it goes through a storage provider instead of a hardcoded filesystem path. That covers the declarative media serving you get today, and app-written uploads or generated files down the road too.
+Anywhere Fymo needs to put or get a blob of bytes, it goes through a storage provider instead of a hardcoded filesystem path. That covers app-written uploads and generated files, and the declarative HTTP exposure described further down this page.
 
 The `storage:` section in `fymo.yml` picks which provider you're using: the built-in local provider, or a dotted path to a class of your own.
 
-There's exactly one active provider per app. That's different from auth, where you can install several providers side by side, each contributing its own hooks. Every method on `StorageProvider` matters here, none of them are optional extras.
+There's exactly one active provider per app, the same as jobs and broadcasts. Every method on `StorageProvider` matters here, none of them are optional extras.
 
 ## The provider interface
 
@@ -59,7 +59,7 @@ provider.read("videos/clip.webm", range=(0, 999))
 
 `LocalStorageProvider` stores blobs directly on disk. Set `root` and it resolves that path relative to `project_root`. Leave `root` out, and it stores directly under `project_root` instead.
 
-Every key passes through the same containment check Fymo already uses for declarative media routes. It's traversal-safe and symlink-safe: no `..` segment, no absolute path override, and no symlink inside the root that quietly resolves somewhere outside it. A key that fails the check raises `ValueError`, not a 500 from some unrelated filesystem error further down.
+Every key passes through the same containment check Fymo uses for `storage.expose` routes. It's traversal-safe and symlink-safe: no `..` segment, no absolute path override, and no symlink inside the root that quietly resolves somewhere outside it. A key that fails the check raises `ValueError`, not a 500 from some unrelated filesystem error further down.
 
 <Tip>
 A range read clamps `end` to the file's actual size instead of treating "past EOF" as an error. Only a start at or past EOF, or an end before start, counts as unsatisfiable:
@@ -102,9 +102,9 @@ This roots storage at `project_root`.
 </Tip>
 
 <Warning>
-There's no default storage provider. Every other pluggable subsystem in Fymo, auth, jobs, broadcasts, falls back to a sensible built-in when you leave it unconfigured. Storage doesn't, on purpose.
+There's no default storage provider. Every other pluggable subsystem in Fymo, jobs and broadcasts included, falls back to a sensible built-in when you leave it unconfigured. Storage doesn't, on purpose.
 
-Silently writing to local disk is exactly the footgun that works fine in development and quietly loses data behind a load balancer in production. So if you configure media routes without a storage section, Fymo fails at startup, not at the first write.
+Silently writing to local disk is exactly the footgun that works fine in development and quietly loses data behind a load balancer in production. So if you configure `storage.expose` entries without a `storage:` provider, Fymo fails at startup, not at the first write.
 </Warning>
 
 ### Writing a custom provider
@@ -169,18 +169,25 @@ Keep in mind: `write()` takes a complete `bytes` payload, there's no streaming a
 Record to a scratch path first, a temp file or `app/data/tmp/`, then read the finished file back and call `write()` once with the whole thing. That pattern keeps working once storage stops being local disk, since object stores like S3 don't offer a "keep appending to this key" operation either.
 </Note>
 
-## Declarative media routes
+## Exposing files over HTTP
+
+Before `storage.expose` existed, an app that needed to stream video with seek and scrub support had to hand-write a raw WSGI handler. That meant repeating Range-header parsing, path-traversal validation, content-type mapping, and 404/400 handling in every app that needed it.
+
+A `storage.expose` entry turns all of that into a single declaration. Each entry becomes an `HttpRoute` with a handler Fymo owns, sitting alongside your app's own routes rather than replacing that seam. Some things, webhooks, non-file responses, still want a fully custom route, and that's fine too.
+
+<Note>
+`storage.expose` used to be its own top-level `media:` section. It moved under `storage:` because every entry's `dir` was already resolved through the configured storage provider's root, so the two keys were never really independent: exposing an entry only made sense once storage was configured. `prefix`, `dir`, and `extensions` keep the exact same meaning, just nested one level deeper.
+</Note>
 
 ```yaml fymo.yml
-media:
-  - prefix: /media/videos/
-    dir: data/videos
-    extensions: [webm]
+storage:
+  provider: local
+  root: data
+  expose:
+    - prefix: /media/videos/
+      dir: videos
+      extensions: [webm]
 ```
-
-Before this existed, an app that needed to stream video with seek and scrub support had to hand-write a raw WSGI handler. That meant repeating Range-header parsing, path-traversal validation, content-type mapping, and 404/400 handling in every app that needed it.
-
-A `media:` entry turns all of that into a single declaration. Each entry becomes an `HttpRoute` with a handler Fymo owns, sitting alongside your app's own routes rather than replacing that seam. Some things, webhooks, non-file responses, still want a fully custom route, and that's fine too.
 
 | Key | Meaning |
 |---|---|
@@ -189,10 +196,38 @@ A `media:` entry turns all of that into a single declaration. Each entry becomes
 | `extensions` | Allowed file extensions, lowercase, no leading dot. A request for anything else gets a `400`, the same response as a path-traversal attempt, so a probing request can't tell the two apart. |
 
 <Warning>
-`/dist/` and `/assets/` are reserved. `FymoApp`'s own dispatch matches them before your app's routes get a turn, so a `media:` prefix landing under either would never be reached.
+A top-level `media:` key is a hard error now, at boot and in `fymo build`:
 
-Fymo prints a startup warning if your prefix overlaps one of these. It still registers the route though, since this is a smell worth flagging loudly, not a guaranteed misconfiguration worth refusing to boot over.
+```
+top-level `media:` was removed, exposure now lives under `storage.expose`.
+Move each media entry under storage: unchanged (prefix/dir/extensions
+keep their meaning).
+```
+
+Move each entry under `storage.expose` and the app is back to working exactly as before.
 </Warning>
+
+<Warning>
+`storage.expose` entries with no `storage.provider` (or `type`/`class`) configured are also a hard error:
+
+```
+storage.expose is configured but storage itself is not: exposed entries
+serve files through the configured StorageProvider and there is no
+default, so storage must be configured. Set storage.provider
+(e.g. `storage: {provider: local, root: data}`).
+```
+
+Exposed files are always served through the configured provider, so there's nothing to serve without one.
+</Warning>
+
+<Note>
+Two more checks run at startup, and neither one fails the build:
+
+- A `prefix` overlapping `/dist/` or `/static/`, Fymo's own reserved prefixes, only prints a warning. Fymo's own dispatch matches those prefixes first, so an overlapping route may never be reached, but the route is still registered.
+- A `dir` that doesn't exist yet under the storage root only warns too. A job might create it later; until then, requests under that prefix 404.
+
+An entry missing `prefix` or `dir` entirely is the one exception, that's a hard error at startup naming the bad entry.
+</Note>
 
 ### Byte-range requests
 
@@ -217,6 +252,25 @@ An unsatisfiable range, a start at or past EOF, or an end before start, gets a `
 A malformed `Range` header, one with non-numeric values, gets a `400` instead. You won't see a raw, unhandled `ValueError` bubble up.
 </Accordion>
 
-Every one of these routes resolves its files through the configured storage provider. The same containment checks apply here as the ones `LocalStorageProvider` uses for its read and exists methods.
+Every `storage.expose` route resolves its files through the configured storage provider. The same containment checks apply here as the ones `LocalStorageProvider` uses for its `read()` and `exists()` methods.
 
-A traversal attempt, or a symlink planted inside the media directory that points outside it, gets a `400`. That's the same response as any other unsafe key.
+A traversal attempt, or a symlink planted inside the exposed directory that points outside it, gets a `400`. That's the same response as any other unsafe key.
+
+## Storage vs static files
+
+A quick way to decide where a file belongs:
+
+- Checked into git, served exactly as-is: put it in `app/static/`.
+- Created or written at runtime: write it through `storage:`.
+- A runtime file that also needs its own URL, video, downloads, generated PDFs: add a `storage.expose` entry on top of `storage:`.
+
+This page covers the last two. For `app/static/`, `app/assets/`, and the rest of the build-input story, see the app directory map and the dedicated assets page.
+
+<CardGroup cols={2}>
+  <Card title="The app/ directory" icon="folder-tree" href="/app-directory">
+    Where static files, build assets, and everything else lives in a Fymo project.
+  </Card>
+  <Card title="Assets, fonts, and static files" icon="image" href="/assets-fonts-and-static-files">
+    CSS, fonts, and images that get compiled or served verbatim.
+  </Card>
+</CardGroup>
