@@ -26,8 +26,10 @@
           "controllers-and-routing",
           "remote-functions",
           "auth",
+          "testing-your-app",
           "jobs-and-broadcasts",
           "storage-and-media",
+          "assets-fonts-and-static-files",
           "configuration",
           "logging"
         ]
@@ -36,6 +38,12 @@
         "group": "Deploy",
         "pages": [
           "deployment"
+        ]
+      },
+      {
+        "group": "Upgrading",
+        "pages": [
+          "upgrading"
         ]
       },
       {

@@ -1,0 +1,155 @@
+---
+title: Testing Your App
+description: Simulate signed-in callers, prove user isolation with acting_as, and bootstrap storage and job providers when testing an app built on Fymo.
+---
+
+A test that calls a remote function directly never constructs a full `FymoApp`, so the process-wide seams a real request depends on are simply missing. The `@identify` resolver chain has nothing registered, and the storage, jobs, and broadcasts provider singletons were never built. `fymo.testing` exists to stand those seams up for the length of a `with` block, then restore everything exactly as it found it.
+
+<Note>
+This page is about testing an app you build on Fymo, calling your own remote functions directly and asserting on the result. If you're looking to run Fymo's own test suite as a contributor to the framework itself, see [Testing](/testing) instead.
+</Note>
+
+## Why tests need help
+
+`FymoApp.__init__` does two things at startup that a bare test process skips entirely. It discovers every `@identify` resolver under `app/auth/` and chains them together, and it builds the storage, jobs, and broadcasts providers from `fymo.yml`. Import a remote function in a test file and call it, and neither of those has happened.
+
+`signed_in` and `acting_as` register a resolver through the exact same `@identify` mechanism a live request uses, so there's no separate mock path that can drift out of sync with production behavior. `init_providers` builds providers the same way `FymoApp.__init__` does. All three restore the prior state on exit, so one test's setup never leaks into the next.
+
+<Note>
+The examples below use two small helpers from the reference blog app: a `db` fixture (an isolated SQLite file per test, see `examples/blog_app/tests/conftest.py`) and `_seed_post`, which inserts one post row directly. Neither is part of `fymo.testing`, they're just how this particular app sets up test data.
+</Note>
+
+## Signing in a caller
+
+`signed_in(uid, *, extras=None)` is a context manager. It registers a resolver that resolves to `Identity(uid=uid)`, opens a request scope, and yields the `Identity`. Inside the block, `current_uid()` returns `uid`, and a remote function guarded with `@require_auth` runs normally instead of raising.
+
+Here's the simplest case, a single signed-in call, adapted from the reference blog app's test suite:
+
+```python tests/test_comments.py
+from fymo.testing import signed_in
+from app.remote.posts import NewComment, create_comment
+
+def test_authenticated_comment_is_attributed_to_the_session_user(db):
+    slug = _seed_post(db)
+    with signed_in(
+        "u_alice",
+        extras={"email": "alice@example.com", "created_at": "2026-01-01T00:00:00Z"},
+    ):
+        comment = create_comment(slug, input=NewComment(body="first!"))
+    assert comment["name"] == "alice"
+```
+
+`create_comment` is called directly, no WSGI request and no test client involved. Inside the block, `current_uid()` resolves to `u_alice`, and `current_extras()` (the typed accessor `app/auth/extras.py` generates) reads back the extras passed in.
+
+`extras` stands in for whatever your app's identity extras hook would normally attach on a real request, an email, a role, whatever your `register_identity_extras_hook` callback returns. Pass it whenever the code under test reads `identity_extras()` or a typed accessor built on it.
+
+<Tip>
+`signed_in` defaults to `uid="u_test1"` when the test doesn't care which caller it is, only that someone is signed in.
+</Tip>
+
+## Proving isolation
+
+`acting_as(uid, *, extras=None)` swaps in a second identity mid-block. It must be nested inside `signed_in()`, calling it on its own raises `RuntimeError` telling you to wrap the body in a `signed_in()` block first. This is the tool for proving one identity can't touch another's data.
+
+Here's the real test from the reference blog app, `python -m pytest tests/test_comments.py -v` passes it as written:
+
+```python tests/test_comments.py
+from fymo.testing import acting_as, signed_in
+from app.remote.posts import NewComment, create_comment, get_comments
+
+def test_second_user_cannot_comment_as_the_first(db):
+    slug = _seed_post(db)
+    with signed_in(
+        "u_alice",
+        extras={"email": "alice@example.com", "created_at": "2026-01-01T00:00:00Z"},
+    ):
+        create_comment(slug, input=NewComment(body="alice's take"))
+        with acting_as(
+            "u_bob",
+            extras={"email": "bob@example.com", "created_at": "2026-01-01T00:00:00Z"},
+        ):
+            bobs_comment = create_comment(slug, input=NewComment(body="bob's reply"))
+        assert bobs_comment["name"] == "bob"
+        comments = get_comments(slug)
+    assert {c["name"] for c in comments} == {"alice", "bob"}
+    rows = db.fetchall("SELECT name, uid FROM comments ORDER BY name")
+    uids = {row["name"]: row["uid"] for row in rows}
+    assert uids["alice"] != uids["bob"]
+```
+
+Walking through what happens:
+
+1. `signed_in("u_alice", ...)` opens the outer scope. Alice's `create_comment` call gets attributed to whatever `current_uid()` and `current_extras()` resolve to right then, her uid and her email.
+2. `acting_as("u_bob", ...)` swaps the identity without leaving the outer block. `current_uid()` now resolves to `u_bob`, and `current_extras()` returns only bob's extras, alice's never leak into the swapped block. Bob's comment gets bob's uid and name.
+3. Exiting the `acting_as` block restores alice's identity exactly, including the cached resolution. The `get_comments` call right after runs back in alice's scope, proving the swap was fully reverted.
+4. Both comments exist by the end. The set of names is `{"alice", "bob"}`, and a direct row check confirms the two rows carry two different uids.
+
+This proves the comment's authorship comes from the resolved identity, never from client input. Nothing passed to `create_comment` says who alice or bob is. The name comes out of `current_extras()`, which comes out of whatever identity `fymo` resolved for that scope, and there's no argument a caller could pass to write a different uid into that row.
+
+<Note>
+`create_comment` reads the author from `current_extras()`, splitting the email at `@` for a display name. That's why both `signed_in` and `acting_as` pass matching `extras` here, without them the author would fall back to the raw uid instead of a name.
+</Note>
+
+## Bootstrapping providers
+
+Neither `signed_in` nor `acting_as` touches storage, jobs, or broadcasts. A bare test process still has no providers installed, so calls like `get_storage_provider()` fail even inside a `signed_in` block. `init_providers(project_root)` fixes that by reading the project's real `fymo.yml` and building the same providers `FymoApp.__init__` would, for the length of the block.
+
+```python tests/test_upload.py
+from pathlib import Path
+import pytest
+from fymo.storage import get_storage_provider
+from fymo.testing import init_providers
+
+
+@pytest.fixture
+def project(tmp_path: Path) -> Path:
+    (tmp_path / "fymo.yml").write_text(
+        "name: scaffold\n"
+        "storage:\n"
+        "  provider: local\n"
+        "  root: app/data/files\n"
+    )
+    return tmp_path
+
+
+def test_storage_provider_works_inside_block(project: Path):
+    with init_providers(project):
+        provider = get_storage_provider()
+        provider.write("hello.txt", b"hi")
+    written = project / "app" / "data" / "files" / "hello.txt"
+    assert written.read_bytes() == b"hi"
+```
+
+This is adapted from Fymo's own test suite (`tests/testing/test_init_providers.py`), which passes as written. `init_providers` also yields a namespace directly, so `with init_providers(project) as providers:` gives you `providers.storage`, `providers.jobs`, and `providers.broadcasts` already built, an alternative to calling the getters yourself.
+
+Storage stays `None` when `fymo.yml` has no `storage:` section, matching `FymoApp` exactly: there's no default provider. Jobs and broadcasts are always initialized. On exit, every provider singleton is restored to whatever it was before the block.
+
+<Warning>
+`init_providers` raises `FileNotFoundError` when `project_root` has no `fymo.yml`. Point it at the same directory `FymoApp` would run from, not an empty scratch directory.
+</Warning>
+
+## Anonymous requests
+
+There's no `signed_out` or `as_anonymous` helper, because there's nothing to simulate. Open a plain request scope with no `signed_in` wrapper, and `current_uid()` returns `None` exactly as it does for a real anonymous visitor:
+
+```python
+from fymo.auth import current_uid
+from fymo.remote.context import request_scope
+
+def test_anonymous_cannot_comment():
+    with request_scope(uid="u_anon", environ={}):
+        assert current_uid() is None
+```
+
+`request_scope` is the same primitive `signed_in` builds on, it just never registers a resolver. With the `@identify` chain empty, `current_uid()` resolves to `None`, the same outcome any unrecognized caller gets on a real request.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="key" href="/auth">
+    The identity model signed_in and acting_as exercise: resolvers, current_uid(), and identity extras.
+  </Card>
+  <Card title="Testing" icon="flask" href="/testing">
+    Running Fymo's own test suite, for contributing to the framework rather than testing an app built on it.
+  </Card>
+</CardGroup>

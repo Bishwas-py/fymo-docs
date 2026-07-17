@@ -1,0 +1,111 @@
+---
+title: Upgrading
+description: Every breaking change between v0.13 and current Fymo, the exact error each one prints, and the fix.
+---
+
+Fymo ships no compatibility shims before 1.0. When something is removed, the app fails loudly at boot or build time, and the error message is the migration instruction. This page collects those moments in one place, newest first.
+
+## Identity rework (~v0.18)
+
+Fymo used to own a user model. It doesn't anymore. Identity is now just a `uid` string your app produces through resolvers you write in `app/auth/`.
+
+**Removed:**
+
+- The `User` dataclass, the `UserStore` Protocol, `SqliteUserStore`, `PostgresUserStore`, and both hand-synced DDL files (`fymo/auth/schema.sql`, `schema_postgres.sql`). The `fymo_users` / `fymo_user_oauth_identities` tables are gone.
+- Every shipped auth provider (`fymo/auth/providers/`: password, Clerk, OAuth, registry), the built-in signup/login/logout/me remotes (`fymo/auth/remote.py`), plus `fymo/auth/email.py` and `fymo/auth/session.py`.
+- `current_user()`, `get_user_store()` / `set_user_store()`, the legacy session-resolver chain, `DECOY_HASH`.
+- The `auth:` block in `fymo.yml` (`enabled`, `user_store`, `providers`).
+- The `fymo[clerk]` extra, the `pyjwt` dependency, and the `oidc` / `oauth` placeholder extras. (`fymo[postgres]` stays, jobs still use psycopg.)
+
+A `fymo.yml` that still has an `auth:` block fails at boot and in `fymo build`:
+
+```
+the `auth:` block was removed, identity now lives in code. Run
+`fymo generate auth` (password login, or --clerk / --skeleton) to
+scaffold app-owned auth into app/auth/, then delete the auth: block
+from fymo.yml. @require_auth still guards remote functions;
+route-level `require_auth:` guards pages.
+```
+
+**Fix:**
+
+1. Delete the `auth:` block from `fymo.yml`.
+2. Run `fymo generate auth` (or `--clerk` / `--skeleton`) and edit the generated code, it's yours now.
+3. Remotes keep `@require_auth`; pages use route-level `require_auth:` instead of anything in config.
+4. Replace `current_user().email`-style access with `identity_extras()`, or the generated typed accessor, `app/auth/extras.py`'s `current_extras()`.
+
+`examples/blog_app` in the Fymo repo is the reference migration, a real app moved through this exact change. See the [Authentication](/auth) page for the full resolver, guard, and extras API.
+
+<Note>
+This is not the same removal as the reserved-prefix warning below. Identity has nothing to do with `/dist/` or `/static/`, those only matter for `storage.expose` collisions, covered next.
+</Note>
+
+## media: removed
+
+Top-level `media:` in `fymo.yml` is gone. Exposure now lives nested under `storage:`, as an `expose` list.
+
+<Warning>
+A top-level `media:` key is a hard error, at boot and in `fymo build`:
+
+```
+top-level `media:` was removed, exposure now lives under `storage.expose`.
+Move each media entry under storage: unchanged (prefix/dir/extensions
+keep their meaning).
+```
+</Warning>
+
+**Fix:** move each entry under `storage.expose`. The keys don't change.
+
+```yaml fymo.yml
+storage:
+  provider: local
+  root: data
+  expose:
+    - prefix: /media/videos/
+      dir: videos
+      extensions: [webm]
+```
+
+Reserved prefixes for `storage.expose` collision warnings are `/dist/` and `/static/`, not `/assets/`. Overlapping one of those only prints a warning, it doesn't fail the build. See [Storage and media](/storage-and-media) for the full expose pipeline.
+
+## /assets/ -> /static/
+
+The URL prefix that served files out of `app/static/` moved. It used to be `/assets/`, it's `/static/` now. The old prefix isn't redirected and doesn't dual-serve, it simply falls through to routing and returns a clean 404.
+
+**Fix:** grep your app for `/assets/` and change it to `/static/`. That's the whole migration.
+
+```
+grep -r "/assets/" app/
+```
+
+## _global.css removed
+
+The old magic auto-injected `app/templates/_global.css` file is gone. Any project still shipping it fails the build.
+
+<Warning>
+```
+Error: _global.css is no longer auto-injected. Move it to app/assets/app.css
+and add `import '../assets/app.css'` to app/templates/_layout.svelte.
+```
+</Warning>
+
+**Fix:** move the file to `app/assets/app.css`, then import it explicitly:
+
+```svelte app/templates/_layout.svelte
+<script>
+  import '../assets/app.css';
+</script>
+```
+
+Any other loose `.css` file under `app/templates/` (outside a component's own `<style>` block) hits a similar hygiene error at build time, naming the offending path. Stylesheets live in `app/assets/` now.
+
+## remote.mode replaces old flags
+
+`remote.explicit_optin` and `remote.allow_implicit` still work, for one deprecation cycle, but they're deprecated in favor of a single `remote.mode` key. Nothing breaks today if your `fymo.yml` still has the old booleans, but plan to move off them.
+
+```yaml fymo.yml
+remote:
+  mode: strict
+```
+
+`strict` only dispatches `@remote`-decorated functions. `implicit-legacy` dispatches every public, type-annotated function in `app/remote/*.py`, the old default behavior, kept around for projects migrating off it gradually. See [Remote functions](/remote-functions) for the full picture.
