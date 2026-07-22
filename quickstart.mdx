@@ -1,9 +1,9 @@
 ---
 title: Quickstart
-description: Install Fymo and run your first project.
+description: Install Fymo, run your first project, and generate a working CRUD resource.
 ---
 
-Let's get you from zero to a running app in about five minutes.
+Let's get you from zero to a running app in about five minutes, and to a working CRUD resource in ten.
 
 <Steps>
 <Step title="Install Fymo">
@@ -27,25 +27,56 @@ This scaffolds a new project, installs its frontend dependencies, and sets up wo
 fymo dev
 ```
 
-Open `http://127.0.0.1:8000` in your browser. You should see your new app running.
+Open `http://127.0.0.1:8000` in your browser.
 </Step>
 </Steps>
 
-That's it, you have a real Fymo app running on your machine.
+## What you're looking at
+
+The home page says **It's alive.** and it's not decoration, it's a proof board. Three cards, each demonstrating one piece of the machinery live, each footed with a mono chip naming the file that produced it:
+
+- **Server**: a render timestamp that traveled from `getContext()` in `app/controllers/home.py` into the HTML before any JavaScript ran.
+- **Client**: a click counter. If it counts, Svelte hydrated the server-rendered page and owns it now.
+- **Identity**: the live value of the `$auth` identity store, `anonymous` until you sign in, resolved by your own code in `app/auth/`.
+
+Edit any of the named files while `fymo dev` runs and the page rebuilds itself. The styling comes from `app/assets/app.css`, a small design-token stylesheet the app owns outright, and the favicon at `app/static/favicon.svg` is wired through `svelte:head` in the root layout.
 
 ## Sign in works already
 
-While `fymo dev` is running, open `http://127.0.0.1:8000/signin`. Sign up with any email and password, nothing to configure first. You're signed in right away, with a real session cookie to prove it.
-
-That's the first genuine "it works" moment for a new Fymo app, even more than the counter demo below.
+Open `http://127.0.0.1:8000/signin`. Sign up with any email and password, nothing to configure first. Back on the home page, the Identity card now shows your uid instead of `anonymous`.
 
 <Tip>
 This is the default password flow, wired up and ready. For the full picture, identity resolvers, route guards, and how to extend or replace it, see [Authentication](/auth).
 </Tip>
 
+## Generate a resource
+
+Now the money path. One command gives you a full CRUD slice:
+
+```bash
+fymo generate resource posts
+```
+
+```
+✓ Generated:
+  app/controllers/posts.py
+  app/templates/posts/index.svelte
+  app/templates/posts/show.svelte
+  app/templates/posts/Item.svelte
+  app/remote/posts.py
+  tests/conftest.py
+  tests/test_posts_remote.py
+Route: /posts is already routed by the `posts` resources entry in fymo.yml.
+Run the generated test with: pytest tests/test_posts_remote.py
+```
+
+Visit `/posts`. A seeded row renders through the typed `$remote` client, and once you're signed in there's a create form. Titles click through to `/posts/1`, where edit and delete appear only for rows you own. The generated test file proves the authorization rules with nine passing tests, run them with the command the generator printed.
+
+Everything it wrote is plain app code, yours to edit, and Fymo will never touch it again. The [Generators](/generators) page covers the whole family: pages, remote modules, components, layouts, broadcasts, and the `fymo destroy` inverse.
+
 ## Project structure
 
-Here's what `fymo new` just set up for you:
+Here's what `fymo new` set up for you:
 
 ```
 my-app/
@@ -55,6 +86,8 @@ my-app/
 │   ├── remote/          # Remote functions (SvelteKit-style RPC)
 │   ├── auth/             # Identity resolvers, who's signed in
 │   ├── assets/           # Build inputs: CSS, fonts, images
+│   ├── static/           # Verbatim files, served at /static/
+│   ├── components/       # Shared Svelte components
 │   ├── lib/               # $lib/* alias target (TS/Svelte only)
 │   └── support/           # Shared server-side utilities
 ├── schema/               # users.sql, the generated auth table
@@ -63,7 +96,7 @@ my-app/
 └── server.py               # Entry point
 ```
 
-`app/jobs/` and `app/broadcasts/` aren't part of the scaffold, you add them the first time you write a background task or a broadcast channel. See [Jobs and broadcasts](/jobs-and-broadcasts).
+`app/jobs/` and `app/broadcasts/` aren't part of the scaffold, you add them the first time you write a background task or generate a broadcast channel. See [Jobs and broadcasts](/jobs-and-broadcasts).
 
 See [the app/ directory](/app-directory) to learn what belongs in each folder.
 
@@ -72,7 +105,7 @@ See [the app/ directory](/app-directory) to learn what belongs in each folder.
 Every page in Fymo pairs a Python controller with a Svelte template. Here's the smallest one you can write.
 
 ```python
-# app/controllers/home.py
+# app/controllers/hello.py
 def getContext():
     return {
         "title": "Welcome to Fymo",
@@ -81,7 +114,7 @@ def getContext():
 ```
 
 ```svelte
-<!-- app/templates/home/index.svelte -->
+<!-- app/templates/hello/index.svelte -->
 <script>
   let { title, message } = $props();
   let count = $state(0);
@@ -92,4 +125,4 @@ def getContext():
 <button onclick={() => count++}>Count: {count}</button>
 ```
 
-The controller returns data, and the template renders it. That's the whole loop, and everything else in Fymo builds on it.
+The controller returns data, and the template renders it. That's the whole loop, and everything else in Fymo builds on it. You don't even have to write these two files by hand: `fymo generate page hello` writes both and wires the route.
