@@ -90,6 +90,35 @@ This proves the comment's authorship comes from the resolved identity, never fro
 `create_comment` reads the author from `current_extras()`, splitting the email at `@` for a display name. That's why both `signed_in` and `acting_as` pass matching `extras` here, without them the author would fall back to the raw uid instead of a name.
 </Note>
 
+### Ownership answers NotFound
+
+The other half of the isolation story is what a second user gets when they try to touch a row they don't own: `NotFound`, not `Forbidden`. A 403 would confirm the row exists to someone who shouldn't know that. This is the convention `fymo generate resource` bakes into its generated code and its generated tests, and it's worth asserting in your own:
+
+```python
+import pytest
+from fymo.remote import NotFound
+from fymo.testing import acting_as, signed_in
+
+
+def test_someone_elses_post_reads_as_missing():
+    with signed_in("u_alice"):
+        post = create_post("mine")
+        with acting_as("u_bob"):
+            with pytest.raises(NotFound):
+                update_post(post["id"], "hijacked")
+```
+
+The unknown-id case and the wrong-owner case raise the identical error, so nothing a caller observes distinguishes "doesn't exist" from "not yours".
+
+### Two accessors named current_uid
+
+Fymo has two functions called `current_uid`, in different namespaces, answering different questions:
+
+- `fymo.auth.current_uid()` is the resolved identity from your `@identify` chain. This is what you attribute writes with.
+- `fymo.remote.current_uid()` is the anonymous `fymo_uid` device cookie every browser gets, signed in or not. It's for things like deduping reactions, never for authorship.
+
+`signed_in` deliberately opens its request scope with a device uid distinct from the identity uid (`u_device_<uid>` versus `<uid>`), because in a real browser the two never coincide. Code that attributes a write through the wrong accessor fails its tests here instead of failing in production, which is exactly the kind of bug this separation exists to catch.
+
 ## Bootstrapping providers
 
 Neither `signed_in` nor `acting_as` touches storage, jobs, or broadcasts. A bare test process still has no providers installed, so calls like `get_storage_provider()` fail even inside a `signed_in` block. `init_providers(project_root)` fixes that by reading the project's real `fymo.yml` and building the same providers `FymoApp.__init__` would, for the length of the block.

@@ -42,6 +42,8 @@ The root logger's level is set to match `logging.level`. Otherwise, the stdlib d
 
 In text mode, app and library records print as `LEVEL logger: message`; fymo's own lines print pre-formatted (see below). In JSON mode, they become `{"logger": ..., "level": ..., "message": ...}` objects instead. An `exc_info` key gets added whenever the record carries a traceback.
 
+One more source rides alongside: the Node sidecar's stderr is captured and forwarded line by line with a `[sidecar]` prefix. A `console.log` inside a component during server-side rendering lands there, so in `fymo dev` you'll see it as `[sidecar] your message` in the terminal instead of it vanishing (or, as in versions before 0.18.1, hanging the request).
+
 ## Request logs
 
 Every completed request gets one log line, at the `INFO` level:

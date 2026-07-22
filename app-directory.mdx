@@ -9,7 +9,7 @@ Every Fymo app is shaped the same way. Once you know this map, you know your way
 |---|---|---|
 | `app/controllers` | Python | Page controllers, one module per route, exposing `getContext()`/`getDoc()` to the matching template. |
 | `app/templates` | Svelte / TS | The page components the router renders, one file per route (plus `_layout.svelte` files). |
-| `app/components` | Svelte / TS | Reusable UI components shared across templates. |
+| `app/components` | Svelte / TS | Reusable UI components shared across templates, importable as `$components/Name.svelte`. `fymo generate component Name` writes here. |
 | `app/assets` | Svelte / TS / CSS | Build inputs: stylesheets, fonts, images. Compiled and content-hashed into `dist/` by esbuild, imported explicitly from a layout, never served raw. |
 | `app/remote` | Python | Functions the browser can call directly through the generated `$remote` client. Public, type-annotated functions are exposed automatically. Add `@remote` to require opting in explicitly. |
 | `app/auth` | Python | Where `@identify` resolvers live, deciding who's signed in. Auto-discovered the same way as `app/remote`, but as a separate glob. |
@@ -18,6 +18,12 @@ Every Fymo app is shaped the same way. Once you know this map, you know your way
 | `app/lib` | TypeScript / Svelte | The `$lib/*` alias target (see `tsconfig.json`). TypeScript-only, since nothing here ever runs on the server. |
 | `app/support` | Python | Shared server-side utilities that don't fit anywhere else: a database connection helper, auth env config, media path helpers, and similar cross-cutting code used by controllers, remote functions, and jobs. |
 | `app/static` | any | Files served verbatim at `/static/<path>`, unchanged by the build. |
+
+One directory lives outside `app/` and still shapes it: `.fymo/templates/` holds project-local overrides for the generator templates. A file there at the same relative path as a packaged template wins over it, so a team's conventions ride along in the repo. `fymo generate templates` publishes the packaged tree there for editing; see [Generators](/generators).
+
+<Tip>
+The `examples/` apps in the Fymo repo are pure generator output now. Reading one is reading exactly what `fymo new` and `fymo generate` produce today, which makes them a reliable reference for this layout.
+</Tip>
 
 ## Task registries
 
