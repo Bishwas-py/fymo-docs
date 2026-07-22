@@ -165,11 +165,11 @@ def project(ident):
 
 Treat this as a whitelist, not a spread. Whatever the function returns is embedded in every page's HTML for that signed-in visitor, so add fields one at a time and leave out anything sensitive. Register nothing, and a signed-in visitor sees the safe default, `{"uid": ...}` alone.
 
-The projection is exposed to Svelte as the `identity` store from `$fymo/auth`, hydrated at SSR and refreshed on every soft navigation:
+The projection is exposed to Svelte as the `identity` store from `$auth`, hydrated at SSR and refreshed on every soft navigation:
 
 ```svelte
 <script>
-  import { identity } from '$fymo/auth'
+  import { identity } from '$auth'
 </script>
 
 {#if $identity}
@@ -187,13 +187,15 @@ The scaffolded `identity` store is enough for most apps. The reference blog app 
 
 `fymo new` scaffolds working password auth by default: `app/auth/`, `app/remote/auth.py`, and a `/signin` page, ready to sign up and sign in against right away. Pass `--no-auth` to skip it and add auth later.
 
-`fymo generate auth` writes that same scaffold into an existing project. Two flags change what it generates:
+`fymo generate auth` writes the identity code into an existing project. Two flags change what it generates:
 
 | Command | Generates | Notes |
 |---|---|---|
-| `fymo generate auth` | `app/auth/{__init__,resolver,store,extras,public}.py`, `app/remote/auth.py`, `app/controllers/signin.py`, `app/templates/signin/index.svelte`, `schema/users.sql` | Session-cookie password auth, sqlite-backed by default. |
+| `fymo generate auth` | `app/auth/{__init__,resolver,store,extras,public}.py`, `app/remote/auth.py`, `schema/users.sql` | Session-cookie password auth, sqlite-backed by default. |
 | `fymo generate auth --clerk` | `app/auth/{__init__,resolver}.py` only | A Clerk JWT resolver. Your app owns the `pyjwt[crypto]` dependency; the import is lazy, so it loads fine without it until the first real request. |
 | `fymo generate auth --skeleton` | `app/auth/{__init__,resolver}.py` only | A stub `@identify` resolver returning `None`, with a comment cheat-sheet for session-cookie and API-key patterns. |
+
+The signin page itself is the one piece `fymo generate auth` doesn't write in an existing project (a fresh `fymo new` ships it). The command's own next-steps say exactly what to add: a `signin: signin.index` route, a controller, and a form calling the `login` remote function. `fymo generate page signin` scaffolds the route and both files; the form body is yours to write.
 
 The `--clerk` resolver reads `CLERK_ISSUER` from the environment, or derives it from `PUBLIC_CLERK_PUBLISHABLE_KEY` when that's unset, and verifies RS256 JWTs against `{issuer}/.well-known/jwks.json`. It namespaces the resolved uid as `clerk:<sub>`, so it can never collide with a uid from another mechanism.
 
