@@ -5,6 +5,48 @@ description: Every breaking change between v0.13 and current Fymo, the exact err
 
 Fymo ships no compatibility shims before 1.0. When something is removed, the app fails loudly at boot or build time, and the error message is the migration instruction. This page collects those moments in one place, newest first.
 
+## v0.20.0: generators
+
+New surface only, nothing breaking for existing apps. `fymo generate` grew page, remote, resource, component, layout, broadcast, and templates subcommands, and `fymo destroy` reverses the first three. See [Generators](/generators).
+
+The examples in the Fymo repo are now pure generator output, so reading `examples/` is reading what the generators produce.
+
+## v0.19.1: fymo --version tells the truth
+
+`fymo --version` now reports the installed package metadata instead of a stale hardcoded string. It used to print `0.1.0` no matter what was installed; if a script parsed that constant, it was being lied to. The new output is truthful:
+
+```
+$ fymo --version
+fymo, version 0.20.0
+```
+
+## v0.19.0: $fymo/auth renamed to $auth
+
+The client identity store's import specifier changed. One find-and-replace migrates you:
+
+```svelte
+import { identity } from '$auth';
+```
+
+A stale import fails the build with the instruction in the error:
+
+```
+app/templates/home/index.svelte:2:25: ERROR: [plugin: fymo-auth]
+$fymo/auth was renamed to $auth, update the import (found '$fymo/auth')
+```
+
+The generated store module also moved flat, from `dist/client/_fymo/auth.js` to `dist/client/_auth.js`, in case any tooling referenced the old path.
+
+## v0.18.1: console.log during SSR
+
+`console.log` in a component rendered on the server used to corrupt the sidecar's stdout protocol and hang the request, silently. Fixed: component console output during SSR now surfaces in `fymo dev`'s terminal, prefixed `[sidecar]`:
+
+```
+[sidecar] hello from SSR
+```
+
+No action needed. If you ever worked around this by stripping console.log before SSR, delete the workaround.
+
 ## Identity rework (~v0.18)
 
 Fymo used to own a user model. It doesn't anymore. Identity is now just a `uid` string your app produces through resolvers you write in `app/auth/`.
