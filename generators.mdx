@@ -1,0 +1,264 @@
+---
+title: Generators
+description: Generate pages, remote modules, full CRUD resources, components, layouts, and broadcast channels, then destroy them just as safely.
+---
+
+Fymo ships a family of code generators under `fymo generate`. One command writes the controller, template, remote module, tests, and route wiring for a feature, and every file it writes is ready to run before you've edited a line.
+
+One idea underpins all of them: **generated code is plain app code**. Templates are inert text Fymo never imports at runtime; the only runtime coupling is the same auto-discovery that picks up files you write by hand. Once generated, the files are yours to edit, and Fymo will never touch them again.
+
+## Pages
+
+```bash
+fymo generate page about
+```
+
+```
+✓ Generated:
+  app/controllers/about.py
+  app/templates/about/index.svelte
+  fymo.yml
+Route: injected `about: about.index` into fymo.yml.
+```
+
+A controller, a template, and the route wired into `fymo.yml`. The injection contract is honest: Fymo edits your config only when the routes block still matches the shape the scaffold produces, verified by reparsing the result. When you've restructured the file, the page files are still generated and the exact line to add is printed instead:
+
+```
+⚠ fymo.yml's routes block does not match the shape the fymo scaffold
+produces, so the route was not injected. Add this line under `routes:`
+in fymo.yml:
+
+  contact: contact.index
+```
+
+Never a half-write, never a silent skip.
+
+## Remote modules
+
+```bash
+fymo generate remote stats
+```
+
+```
+✓ Generated:
+  app/remote/stats.py
+  tests/test_stats_remote.py
+Run the generated test with: pytest tests/test_stats_remote.py
+```
+
+A typed remote module with in-memory stand-in rows, plus a test file driving it through `fymo.testing`'s `signed_in` and `acting_as`. When the project has no `tests/conftest.py` yet, one is generated too, so `pytest` works from any directory.
+
+## Resources
+
+The flagship. A resource is a page and a remote module generated together, wired as full CRUD:
+
+```bash
+fymo generate resource posts
+```
+
+```
+✓ Generated:
+  app/controllers/posts.py
+  app/templates/posts/index.svelte
+  app/templates/posts/show.svelte
+  app/templates/posts/Item.svelte
+  app/remote/posts.py
+  tests/conftest.py
+  tests/test_posts_remote.py
+Route: /posts is already routed by the `posts` resources entry in fymo.yml.
+Run the generated test with: pytest tests/test_posts_remote.py
+```
+
+The emitted API speaks grammatical English. The collection function keeps the plural, everything addressing one row speaks singular, and the TypedDict takes the singular name:
+
+```python
+class Post(TypedDict): ...
+
+def list_posts() -> list[Post]: ...
+def get_post(id: int) -> Post: ...
+def create_post(title: str) -> Post: ...
+def update_post(id: int, title: str) -> Post: ...
+def delete_post(id: int) -> Post: ...
+```
+
+The singularizer handles the non-trivial cases too. `fymo generate resource courses` emits `get_course` and a `Course` TypedDict, not `get_course_` or a mangled stem.
+
+Route wiring uses a `resources:` entry in `fymo.yml`, which is what makes both `/posts` and `/posts/<id>` exist through the Router's resources expansion. The index page renders the list through the typed `$remote` client, shows a create form to signed-in visitors, and links each title to the detail page, where edit and delete controls appear only on rows the visitor owns. A co-located `Item.svelte` renders one row.
+
+The generated test file carries nine tests: the seed row lists and fetches, an unknown id raises NotFound, the owner can update and delete, someone else's row reads as missing, and anonymous mutations get 401.
+
+Two authorization conventions in the generated code are deliberate, and worth keeping when you edit it:
+
+1. **The author comes from the authenticated identity, never client input.** `create_post` stamps `current_uid()` on the row; there is no `author` parameter to forge.
+2. **Ownership mismatches answer NotFound, never Forbidden.** A 403 would confirm the id exists to someone who shouldn't know that. The generated helper's own comment says it plainly:
+
+```python
+def _owned_or_not_found(id: int) -> Post:
+    # Unknown id and someone else's row answer identically: a 403 on the
+    # ownership check would leak that the id exists.
+    row = _find(id)
+    if row is None or row["created_by"] != current_uid():
+        raise NotFound(f"post {id} not found")
+    return row
+```
+
+### Without auth
+
+In a project with no `app/auth/` (scaffolded with `fymo new --no-auth`, or before you've run `fymo generate auth`), the resource generator emits a read-only variant instead of silently generating guards that could never pass:
+
+```
+⚠ No app/auth/ in this project, so notes was generated read-only
+(list_notes and get_note only). For full CRUD: run `fymo generate auth`,
+then `fymo generate resource notes --force`.
+```
+
+The page renders the list and detail views with no create form and no owner controls. The upgrade path is exactly what the message says: generate auth, then regenerate the resource with `--force`.
+
+## Components and layouts
+
+```bash
+fymo generate component TagBadge
+```
+
+```
+✓ Generated:
+  app/components/TagBadge.svelte
+Import it with: import TagBadge from '$components/TagBadge.svelte';
+```
+
+Component names are PascalCase, matching how you'll import them.
+
+```bash
+fymo generate layout posts
+```
+
+```
+✓ Generated:
+  app/templates/posts/_layout.svelte
+Every page under app/templates/posts/ now renders inside it.
+```
+
+A layout for a section with no pages yet is dead code, so the generator refuses and tells you what to do first:
+
+```
+✗ app/templates/admin/ does not exist yet, and a layout without pages
+is dead code. Generate a page first: `fymo generate page admin`.
+```
+
+## Broadcasts
+
+```bash
+fymo generate broadcast activity
+```
+
+```
+✓ Generated:
+  app/broadcasts/__init__.py
+  app/broadcasts/activity.py
+  tests/test_activity_broadcast.py
+Publish with fymo.broadcast.publish('activity_activity', id=..., data=...);
+subscribe in the browser via $broadcast/activity after `fymo build`.
+```
+
+The generated channel is working code, not a stub: a typed payload, a subscribe-time guard, and the client-side usage documented in the file's own docstring:
+
+```js
+import { subscribe } from '$broadcast/activity';
+
+const unsubscribe = subscribe.activity_activity({ id }, (data) => {
+  // react to data.kind
+});
+```
+
+See [Jobs and broadcasts](/jobs-and-broadcasts) for how channels, guards, and publishing fit together.
+
+## Conflicts and previews
+
+Every generator refuses loudly by default when a target file exists, naming each one:
+
+```
+✗ app/controllers/about.py already exists and `fymo generate page` never
+overwrites it. Delete or move it first, then rerun (or pass --force to
+overwrite, --diff to preview).
+```
+
+Three flags cover the rest:
+
+- `--force` overwrites.
+- `--dry-run` lists every path (`would create` / `would update`) and writes nothing.
+- `--diff` prints a unified diff of what would change and writes nothing.
+
+```bash
+fymo generate resource widgets --dry-run
+```
+
+```
+  would create  app/controllers/widgets.py
+  would create  app/templates/widgets/index.svelte
+  would create  app/templates/widgets/show.svelte
+  would create  app/templates/widgets/Item.svelte
+  would create  app/remote/widgets.py
+  would create  tests/test_widgets_remote.py
+  would update  fymo.yml
+```
+
+## Destroying
+
+`fymo destroy page|remote|resource <name>` is the safe inverse:
+
+```bash
+fymo destroy resource gadgets
+```
+
+```
+✓ Removed:
+  app/controllers/gadgets.py
+  app/templates/gadgets/index.svelte
+  app/templates/gadgets/show.svelte
+  app/templates/gadgets/Item.svelte
+  app/remote/gadgets.py
+  tests/test_gadgets_remote.py
+  app/templates/gadgets/
+Route: removed resources entry `- gadgets` from fymo.yml.
+```
+
+Generate followed by destroy leaves the tree byte-identical to where it started, `fymo.yml` included.
+
+The safety rule: destroy deletes only files still byte-identical to a pristine render of the current templates. Anything modified since generation makes the whole operation refuse, all-or-nothing:
+
+```
+✗ app/remote/trinkets.py was modified since generation and
+`fymo destroy resource` only deletes byte-identical generated files.
+Rerun with --force to delete it anyway.
+```
+
+The route entry is un-injected only when the reparsed file equals the old mapping minus exactly that one entry, the same never-a-half-write contract as injection.
+
+<Note>
+Coverage matches what the CLI's own help says: destroy handles page, remote, and resource. Generated component, layout, and broadcast files are single plain files, delete those by hand.
+</Note>
+
+## Template overrides
+
+Every generator renders from a packaged template tree, and a project can override any of it. A file at `.fymo/templates/<same relative path>` wins over the packaged version, with identical tokens and identical conflict behavior. This applies to `fymo generate auth` too.
+
+`fymo generate templates` publishes the packaged tree into your project for editing:
+
+```bash
+fymo generate templates
+```
+
+It writes 25 template files under `.fymo/templates/` (`page/`, `remote/`, `resource_page/`, `component/`, `layout/`, `broadcast/`, `auth/`). The project scaffold itself is excluded, since `fymo new` runs outside any project.
+
+Edit one and the next generate picks it up. Add a line to `.fymo/templates/page/controller.py.tmpl`, run `fymo generate page teamcheck`, and the generated controller opens with your line:
+
+```python
+# Team convention: all controllers carry an owner tag.
+"""Controller for the teamcheck page."""
+```
+
+Delete an override file and the packaged template is back in charge. Overrides are per-project and version-controlled with the rest of your app, so a team convention travels with the repo.
+
+## Auth
+
+`fymo generate auth` predates the rest of the family and has its own page. It scaffolds app-owned identity code into `app/auth/` (password by default, `--clerk` and `--skeleton` variants), and it honors the same `.fymo/templates/` overrides and conflict flags as everything here. See [Authentication](/auth).

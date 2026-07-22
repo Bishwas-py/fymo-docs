@@ -23,6 +23,7 @@
         "group": "Core Concepts",
         "pages": [
           "app-directory",
+          "generators",
           "controllers-and-routing",
           "remote-functions",
           "auth",
